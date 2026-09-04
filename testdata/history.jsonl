@@ -1,0 +1,4 @@
+{"display":"first prompt in session A","pastedContents":{},"timestamp":1700000001000,"project":"/home/user/projA","sessionId":"sess-a1"}
+{"display":"second prompt in session A","pastedContents":{},"timestamp":1700000003000,"project":"/home/user/projA","sessionId":"sess-a1"}
+{"display":"[Pasted text #1 +2 lines]","pastedContents":{"1":{"id":"p1","type":"text","content":"actual pasted content here"}},"timestamp":1700000002000,"project":"/home/user/projB","sessionId":"sess-b1"}
+{"display":"prompt in session B after paste","pastedContents":{},"timestamp":1700000005000,"project":"/home/user/projB","sessionId":"sess-b1"}

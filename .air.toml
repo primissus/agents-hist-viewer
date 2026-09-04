@@ -1,0 +1,12 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "go build -o ./tmp/chv ./cmd/chv"
+  bin = "./tmp/chv"
+  include_ext = ["go"]
+  exclude_dir = ["tmp", "testdata", "vendor"]
+  delay = 200
+
+[log]
+  main_only = true
