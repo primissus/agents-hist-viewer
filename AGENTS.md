@@ -4,6 +4,15 @@ Claude Code & Cursor History Viewer (`chv`): Go CLI + Bubble Tea TUI. Indexes Cl
 
 User docs: [README.md](README.md). File for coding agents.
 
+## Project context
+
+- Architecture → .context/architecture.md
+- Conventions → .context/conventions.md
+- Decisions → .context/decisions.md
+- Glossary → .context/glossary.md
+- Workflow → .context/workflow.md
+- Known issues → .context/known-issues.md
+
 ## Commands
 
 ```sh
