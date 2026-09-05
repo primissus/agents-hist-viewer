@@ -16,7 +16,7 @@ var _ domain.SearchRepository = (*Repo)(nil)
 type Repo struct{ db *sql.DB }
 
 func Open(path string) (*Repo, error) {
-	db, err := sql.Open("sqlite", path+"?_journal_mode=WAL&_foreign_keys=ON")
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(wal)&_pragma=foreign_keys(1)")
 	if err != nil {
 		return nil, err
 	}
@@ -66,6 +66,11 @@ func (r *Repo) ReplaceSession(ctx context.Context, s domain.Session, msgs []doma
 		rowids = append(rowids, id)
 	}
 	rows.Close()
+
+	preserved, err := preservedEmbeddings(ctx, tx, s.ID)
+	if err != nil {
+		return err
+	}
 
 	for _, rid := range rowids {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM messages_fts WHERE rowid = ?`, rid); err != nil {
@@ -120,9 +125,67 @@ func (r *Repo) ReplaceSession(ctx context.Context, s domain.Session, msgs []doma
 		if _, err := tx.ExecContext(ctx, `INSERT INTO messages_fts(rowid,text) VALUES(?,?)`, rowid, m.Text); err != nil {
 			return fmt.Errorf("insert fts %d: %w", rowid, err)
 		}
+		if matches, ok := preserved[m.Sequence]; ok {
+			hash := textHash(m.Text)
+			for _, pe := range matches {
+				if pe.textHash != hash {
+					continue
+				}
+				if _, err := tx.ExecContext(ctx,
+					`INSERT INTO embeddings(message_rowid, model, dim, vector, text_hash, created_at)
+					 VALUES(?,?,?,?,?,?)`,
+					rowid, pe.model, pe.dim, pe.vector, pe.textHash, pe.createdAt,
+				); err != nil {
+					return fmt.Errorf("reattach embedding %d: %w", rowid, err)
+				}
+			}
+		}
 	}
 
 	return tx.Commit()
+}
+
+type preservedEmbedding struct {
+	model     string
+	dim       int
+	vector    []byte
+	textHash  string
+	createdAt string
+}
+
+// preservedEmbeddings reads embeddings for a session's current messages,
+// keyed by seq, before ReplaceSession deletes them (the FK cascade would
+// otherwise wipe them for good). Re-inserted after the new messages land,
+// matching on (seq, text_hash) so unchanged blocks keep their vectors across
+// a re-index and only genuinely changed ones need re-embedding.
+func preservedEmbeddings(ctx context.Context, tx *sql.Tx, sessionID string) (map[int][]preservedEmbedding, error) {
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name='embeddings'`).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if exists == 0 {
+		return nil, nil
+	}
+
+	rows, err := tx.QueryContext(ctx,
+		`SELECT m.seq, e.model, e.dim, e.vector, e.text_hash, e.created_at
+		 FROM embeddings e JOIN messages m ON m.rowid = e.message_rowid
+		 WHERE m.session_id = ?`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[int][]preservedEmbedding)
+	for rows.Next() {
+		var seq int
+		var pe preservedEmbedding
+		if err := rows.Scan(&seq, &pe.model, &pe.dim, &pe.vector, &pe.textHash, &pe.createdAt); err != nil {
+			return nil, err
+		}
+		out[seq] = append(out[seq], pe)
+	}
+	return out, rows.Err()
 }
 
 func (r *Repo) Search(ctx context.Context, query string, limit int) ([]domain.SearchHit, error) {
@@ -265,18 +328,10 @@ func (r *Repo) SessionByID(ctx context.Context, id string) (domain.SessionDetail
 	defer rows.Close()
 
 	for rows.Next() {
-		var m domain.Message
-		var tsStr string
-		var isSidechain int
-		if err := rows.Scan(
-			&m.UUID, &m.ParentUUID, &m.SessionID,
-			&m.Role, &m.Kind, &m.ToolName,
-			&m.Source, &tsStr, &m.Sequence, &isSidechain, &m.Text,
-		); err != nil {
+		m, err := scanMessage(rows)
+		if err != nil {
 			return detail, err
 		}
-		m.IsSidechain = isSidechain != 0
-		m.Timestamp, _ = time.Parse(time.RFC3339Nano, tsStr)
 		detail.Messages = append(detail.Messages, m)
 	}
 	return detail, rows.Err()

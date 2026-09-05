@@ -26,6 +26,15 @@ func CronEntry(chvPath, schedule, logPath string) string {
 		schedule, shellQuote(chvPath), shellQuote(logPath), CronManagedMarker)
 }
 
+// CronEntryEmbed builds a crontab line for `chv index --deep && chv embed`
+// (opt-in via `cronctl install --embed`). Embedding needs --deep because
+// Bash tool_use blocks are only indexed at that depth.
+func CronEntryEmbed(chvPath, schedule, logPath string) string {
+	bin := shellQuote(chvPath)
+	return fmt.Sprintf("%s (%s index --deep && %s embed) >> %s 2>&1 %s",
+		schedule, bin, bin, shellQuote(logPath), CronManagedMarker)
+}
+
 // MergeCronLines removes existing chv-managed lines and appends entry.
 func MergeCronLines(existing []string, entry string) []string {
 	var out []string
@@ -62,8 +71,9 @@ func trimTrailingBlankLines(lines []string) []string {
 	return lines[:end]
 }
 
-// InstallCronJob adds or replaces the chv index cron entry.
-func InstallCronJob(chvPath, schedule string) error {
+// InstallCronJob adds or replaces the chv index cron entry. When embed is
+// true, the job runs `chv index --deep && chv embed` instead of plain index.
+func InstallCronJob(chvPath, schedule string, embed bool) error {
 	if schedule == "" {
 		schedule = defaultCronSchedule
 	}
@@ -85,6 +95,9 @@ func InstallCronJob(chvPath, schedule string) error {
 		return err
 	}
 	entry := CronEntry(chvPath, schedule, logPath)
+	if embed {
+		entry = CronEntryEmbed(chvPath, schedule, logPath)
+	}
 	merged := MergeCronLines(existing, entry)
 	return writeCrontab(merged)
 }

@@ -44,3 +44,27 @@
 - **Why:** standard, out of the repo, survives uninstall.
 - **Rejected:** dotfiles in `$HOME`, repo-local state.
 - **Status:** current
+
+## [embed] · SQLite blob vectors + brute-force cosine, no vector DB
+- **Decision:** store `[]float32` vectors as little-endian blobs in an `embeddings` table (`internal/adapter/sqlite/embedding_repo.go`); nearest-neighbor search loads matching rows and computes cosine in Go, no ANN index.
+- **Why:** scale on this machine is ~10-40k embeddable blocks; brute-force cosine is <50ms at 50k×1024 — a vector DB (Postgres/pgvector) or ANN library adds a daemon or dependency for no measurable benefit at this scale. `Nearest`/`EmbeddingsWithContext` sit behind `domain.EmbeddingRepository` so a `coder/hnsw`-backed adapter can replace brute force later without touching `EmbedService`/`AskService`/`PatternService`.
+- **Rejected:** Postgres+pgvector (daemon, no benefit under ~1M vectors), an ANN library from day one (premature), a separate vector-only sidecar DB.
+- **Status:** current
+
+## [embed] · Ollama as the one allowed local HTTP dependency
+- **Decision:** `internal/adapter/ollama` implements `domain.Embedder` and `domain.ChatModel` against a local Ollama server (`http://localhost:11434` by default); default models `mxbai-embed-large` (1024d embeddings) and `qwen3.6:35b-a3b` (chat), overridable via flags or `index.json`.
+- **Why:** keeps `chv embed`/`ask`/`patterns` fully local and free (no API keys, no data leaving the machine), and Ollama was already the locally-available model runtime.
+- **Rejected:** a cloud embedding/chat API (breaks the "your data stays local" property of the tool), bundling a model runtime into `chv` itself.
+- **Status:** current
+
+## [embed] · Embeddings survive re-index via (seq, text_hash) reattach
+- **Decision:** `ReplaceSession` reads existing `embeddings` rows for a session's current messages before deleting them, and re-inserts the same vectors against the new rowids where `(seq, sha256(text))` still matches after re-insert; the FK `ON DELETE CASCADE` on `embeddings.message_rowid` cleans up everything else.
+- **Why:** message rowids aren't stable across a full-replace re-index (SQLite reuses freed rowids), and re-embedding unchanged content on every cron re-index would be wasteful and slow.
+- **Rejected:** a stable non-rowid message identity column (bigger schema change); always re-embedding after any re-index (simple but wasteful).
+- **Status:** current
+
+## [embed] · Pure-Go k-means++ over L2-normalized vectors, no clustering library
+- **Decision:** `internal/adapter/cluster` implements k-means++ init + Lloyd's algorithm using squared Euclidean distance on L2-normalized vectors (equivalent to maximizing cosine similarity for unit vectors), plus an approximate silhouette score to auto-pick `k` from a candidate set.
+- **Why:** keeps the "pure Go, no heavy deps" constraint; the corpus size here (thousands, not millions, of vectors) doesn't need a specialized clustering library, and the approximation is only used to rank a handful of candidate `k` values, not for final cluster quality guarantees.
+- **Rejected:** a Go ML/clustering package, computing exact (full pairwise) silhouette.
+- **Status:** current

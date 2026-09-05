@@ -1,6 +1,9 @@
 package domain
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 type TranscriptSource interface {
 	Sessions(ctx context.Context) ([]Session, error)
@@ -41,4 +44,39 @@ type RecentQuery struct {
 	RecordKind  RecordKind // empty = all
 	ProjectPath string     // empty = all
 	Vendor      Vendor     // empty = all
+}
+
+// Embedder turns text into vectors using a local embedding model.
+type Embedder interface {
+	Embed(ctx context.Context, texts []string) ([][]float32, error)
+	Model() string
+	Dim() int
+}
+
+// ChatModel answers a question given a system and user prompt.
+type ChatModel interface {
+	Chat(ctx context.Context, system, user string) (string, error)
+}
+
+// EmbedFilter narrows embedding operations to a subset of messages.
+type EmbedFilter struct {
+	Vendor      Vendor
+	ProjectPath string
+	Roles       []Role
+	Kinds       []BlockKind
+	Since       time.Time
+	Force       bool  // ignore already-embedded state (UnembeddedUnits only)
+	AfterRowID  int64 // pagination cursor (UnembeddedUnits only): only rows with rowid > this
+}
+
+// EmbeddingRepository stores and queries message-block vectors for a model.
+type EmbeddingRepository interface {
+	InitEmbeddings(ctx context.Context) error
+	UnembeddedUnits(ctx context.Context, model string, f EmbedFilter, limit int) ([]EmbedUnit, error)
+	PutEmbeddings(ctx context.Context, e []Embedding) error
+	Nearest(ctx context.Context, model string, q []float32, k int, f EmbedFilter) ([]VectorHit, error)
+	EmbeddingsWithContext(ctx context.Context, model string, f EmbedFilter) ([]EmbeddingContext, error)
+	MessageByRowID(ctx context.Context, rowid int64) (Message, error)
+	Neighbors(ctx context.Context, sessionID string, seq, radius int) ([]Message, error)
+	BashUnits(ctx context.Context, f EmbedFilter) ([]EmbedUnit, error)
 }

@@ -10,10 +10,41 @@ import (
 
 var defaultPatterns = []string{"PLAN.md", "PROGRESS.md"}
 
-// IndexConfig controls fd-based plan file discovery during full index.
+const (
+	defaultEmbedModel = "mxbai-embed-large"
+	defaultChatModel  = "qwen3.6:35b-a3b"
+	defaultOllamaURL  = "http://localhost:11434"
+)
+
+// IndexConfig controls fd-based plan file discovery during full index, plus
+// the local Ollama models used by `chv embed`/`ask`/`patterns`.
 type IndexConfig struct {
 	Directories []string `json:"directories"`
 	Patterns    []string `json:"patterns"`
+	EmbedModel  string   `json:"embed_model"`
+	ChatModel   string   `json:"chat_model"`
+	OllamaURL   string   `json:"ollama_url"`
+}
+
+func (c IndexConfig) EmbedModelOrDefault() string {
+	if c.EmbedModel == "" {
+		return defaultEmbedModel
+	}
+	return c.EmbedModel
+}
+
+func (c IndexConfig) ChatModelOrDefault() string {
+	if c.ChatModel == "" {
+		return defaultChatModel
+	}
+	return c.ChatModel
+}
+
+func (c IndexConfig) OllamaURLOrDefault() string {
+	if c.OllamaURL == "" {
+		return defaultOllamaURL
+	}
+	return c.OllamaURL
 }
 
 // IndexConfigPath returns the default index config JSON path (XDG config).

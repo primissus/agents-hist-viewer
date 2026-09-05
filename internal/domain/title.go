@@ -30,6 +30,28 @@ func DeriveTitle(text string, maxRunes int) string {
 	return ""
 }
 
+// CleanText strips standalone XML wrapper lines, slash-command-only lines,
+// and bracket-metadata lines from multi-line text, keeping the rest intact
+// (unlike DeriveTitle, this returns the full remaining text, not one line).
+func CleanText(text string) string {
+	var kept []string
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if isStandaloneXMLTag(trimmed) || isSlashCommand(trimmed) || isBracketMetadata(trimmed) {
+			continue
+		}
+		cleaned := strings.TrimSpace(stripLeadingXMLTags(trimmed))
+		if cleaned == "" {
+			continue
+		}
+		kept = append(kept, cleaned)
+	}
+	return strings.Join(kept, "\n")
+}
+
 func isStandaloneXMLTag(line string) bool {
 	line = strings.TrimSpace(line)
 	if !strings.HasPrefix(line, "<") || !strings.HasSuffix(line, ">") {

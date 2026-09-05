@@ -14,6 +14,12 @@
 - **Fingerprint** → content hash of a transcript/plan file used to skip unchanged files
 - **FTS / FTS5** → SQLite full-text search virtual table (`messages_fts`), tokenizer `unicode61 remove_diacritics 2`
 - **BM25** → default FTS5 ranking used for search ordering
+- **Embed unit** → a message block selected as a candidate for embedding: user/assistant `text`, or a Bash `tool_use` command (`domain.EmbedUnit`)
+- **Embedding** → an L2-normalized `[]float32` vector for one embed unit under a given model, stored in the `embeddings` table (`domain.Embedding`)
+- **Cluster** → a group of embeddings produced by k-means++ (`internal/adapter/cluster`), used by `chv patterns` to find repeated intents/commands
+- **Candidate** (skill/script) → a ranked, chat-model-labeled cluster or command n-gram surfaced by `chv patterns`, optionally written as `SKILL-CANDIDATE-<slug>.md` / `SCRIPT-CANDIDATE-<slug>.md`
+- **RAG** → retrieval-augmented generation: `chv ask` retrieves relevant embed units, then asks a chat model to answer citing them
+- **Ollama** → the local model runtime chv talks to for embeddings (`mxbai-embed-large` default) and chat (`qwen3.6:35b-a3b` default), via `internal/adapter/ollama`
 
 ## Main entities
 - **Session** → `id, title, project_path, git_branch, started_at, ended_at, message_count, file_path, has_transcript, record_kind, vendor`

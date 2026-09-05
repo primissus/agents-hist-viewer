@@ -35,6 +35,7 @@ func cmdInstall(args []string) {
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
 	schedule := fs.String("schedule", "0 */4 * * *", "cron schedule expression")
 	chvPath := fs.String("chv", "", "path to chv binary")
+	embed := fs.Bool("embed", false, "run `chv index --deep && chv embed` instead of plain index")
 	fs.Parse(args)
 
 	bin := *chvPath
@@ -48,12 +49,16 @@ func cmdInstall(args []string) {
 		os.Exit(1)
 	}
 
-	if err := config.InstallCronJob(bin, *schedule); err != nil {
+	if err := config.InstallCronJob(bin, *schedule, *embed); err != nil {
 		fmt.Fprintf(os.Stderr, "install-cron: %v\n", err)
 		os.Exit(1)
 	}
+	entry := config.CronEntry(bin, *schedule, config.IndexLogPath())
+	if *embed {
+		entry = config.CronEntryEmbed(bin, *schedule, config.IndexLogPath())
+	}
 	fmt.Printf("Installed cron job (%s)\n", *schedule)
-	fmt.Printf("  %s\n", config.CronEntry(bin, *schedule, config.IndexLogPath()))
+	fmt.Printf("  %s\n", entry)
 }
 
 func cmdUninstall(args []string) {

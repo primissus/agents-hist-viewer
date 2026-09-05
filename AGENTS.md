@@ -25,7 +25,7 @@ make install-cron   # optional: cron every 4h for chv index
 make uninstall-cron # remove chv-managed cron entry
 ```
 
-Entry: `cmd/chv/main.go` — subcommands `index` (`i`), `search`, `view` (`v`), default TUI.
+Entry: `cmd/chv/main.go` — subcommands `index` (`i`), `search`, `view` (`v`), `embed`, `ask`, `patterns`, default TUI.
 
 ## Architecture
 
@@ -34,9 +34,9 @@ Hexagonal layout. Deps point inward.
 ```
 cmd/chv/              CLI wiring, flags, stdout/stderr
 internal/
-  domain/             models (Vendor, RecordKind), ShrinkConfig, search query compiler, port interfaces
-  app/                IndexService, SearchService (use cases)
-  config/             XDG paths (DB, search history, index.json, manual archive)
+  domain/             models (Vendor, RecordKind), ShrinkConfig, search query compiler, embedding types, port interfaces
+  app/                IndexService, SearchService, EmbedService, AskService, PatternService (use cases)
+  config/             XDG paths (DB, search history, index.json incl. embed/chat model + ollama_url, manual archive)
   adapter/
     transcript/       ~/.claude/projects JSONL
     cursor/transcript ~/.cursor/projects agent-transcripts JSONL
@@ -45,7 +45,9 @@ internal/
     opencode/transcript opencode.db (read-only SQLite)
     history/          ~/.claude/history.jsonl
     plan/             Claude PLAN.md/PROGRESS.md (fd scan + index.json dirs)
-    sqlite/           FTS5 repository + inline schema migrations
+    sqlite/           FTS5 repository + inline schema migrations + embeddings table CRUD/search
+    ollama/           HTTP client: domain.Embedder + domain.ChatModel against a local Ollama server
+    cluster/          pure-Go k-means++ over []float32 (for chv patterns)
     tui/              Bubble Tea UI
 ```
 
@@ -56,6 +58,9 @@ internal/
 - `PromptLog` — list typed prompts
 - `PlanSource` — list plan file paths to index
 - `SearchRepository` — init, replace session, file hash, search, recent, session detail
+- `Embedder` — embed texts into vectors (Ollama)
+- `ChatModel` — answer a system+user prompt (Ollama)
+- `EmbeddingRepository` — embeddings CRUD, nearest-neighbor + clustering reads, Bash command reads, message-by-rowid/neighbors
 
 New I/O/storage backends implement these interfaces; logic stays in `internal/app`.
 
@@ -71,6 +76,12 @@ Index applies `domain.Shrink` to tool payloads (configurable cap; images dropped
 **Vendors** — `domain.Vendor`: `claude` (default), `claude-desktop`, `cursor`, `opencode`, `codex`. Stored on `sessions.vendor`. Empty filter = all vendors. Session ID prefixes: `cursor:`, `cursor-plan:`, `opencode:`, `codex:`, `plan:`.
 
 **Schema migrations** — `sqlite.Repo.Init()` runs `CREATE TABLE IF NOT EXISTS` plus `ALTER TABLE` for legacy DBs. Migrations must add columns before indexes on those columns. `Init` is called from `IndexService` on index; users upgrade via `chv index`.
+
+5. **Embed** (`EmbedService.Run`): fetches not-yet-embedded eligible blocks (user/assistant text, Bash `tool_use`) via `EmbeddingRepository.UnembeddedUnits`, cleans/truncates text, embeds in batches via `domain.Embedder`, commits per batch (resumable). `sqlite.Repo.ReplaceSession` preserves embeddings across re-index when `(seq, sha256(text))` is unchanged; FK cascade removes the rest.
+6. **Ask** (`AskService.Ask`): embeds the question, brute-force `Nearest` cosine search (deduped, max 3/session), expands ±2 neighbor blocks per hit, asks `domain.ChatModel` to answer citing `[n]` unless `--no-llm`.
+7. **Patterns** (`PatternService.Run`): clusters embeddings (`adapter/cluster`, auto-`k` via approximate silhouette) for skill candidates (user-prompt intents) and script candidates (Bash command n-grams, exact-match + embedding clusters); ranks by distinct sessions, drops <3-session clusters and trivial single commands, labels via chat model unless `--no-llm`.
+
+Config: `index.json` also holds `embed_model` / `chat_model` / `ollama_url` (`internal/config/index_config.go`, `*OrDefault()` methods) — defaults `mxbai-embed-large`, `qwen3.6:35b-a3b`, `http://localhost:11434`.
 
 ## Conventions
 
@@ -92,7 +103,9 @@ Index applies `domain.Shrink` to tool payloads (configurable cap; images dropped
 | `adapter/history` | Resolves `[Pasted text …]` placeholders via `pastedContents`. |
 | `adapter/plan` | fd/walk scan for Claude `PLAN.md`/`PROGRESS.md` under `~/.claude` + configured `index.json` directories; `PlanSource.PlanPaths`. Manual `FromFile` for `chv index <file>`. |
 | `adapter/claudesettings` | Reads Claude `plansDirectory` settings but is not wired into indexing yet; document `index.json` for external plan directories. |
-| `adapter/sqlite` | FTS5 + BM25; search dedupes by session. `RecentQuery` filters `record_kind`, `project_path`, `vendor`. |
+| `adapter/sqlite` | FTS5 + BM25; search dedupes by session. `RecentQuery` filters `record_kind`, `project_path`, `vendor`. `embedding_repo.go`: `embeddings` table (blob vectors, L2-normalized, little-endian float32), brute-force cosine `Nearest`, `EmbeddingsWithContext` for clustering, `BashUnits` for n-gram mining. |
+| `adapter/ollama` | `POST /api/embed` (batch) + `/api/chat` (non-streaming); 3x retry on 5xx; clear error + `ollama pull` hint on missing model. |
+| `adapter/cluster` | k-means++ init + Lloyd's on squared-Euclidean over unit vectors (≡ cosine); `PickK` auto-selects `k` from a candidate set via approximate silhouette on a sample. |
 | `adapter/tui` | Views: results, detail, filter (path/type/vendor + pagination), help. Clipboard via `pbcopy` (darwin) / `xclip` (linux). Filter `esc` closes; `c` clears active category in-modal. |
 
 ## What to avoid

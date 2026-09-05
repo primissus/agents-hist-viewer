@@ -22,6 +22,22 @@ chv view ./chat.jsonl # open one transcript without indexing
 chv                # launch interactive TUI
 ```
 
+## Local RAG & pattern mining (optional)
+
+`chv embed`, `chv ask`, and `chv patterns` add semantic search, question-answering, and usage-pattern mining over your own indexed history — entirely local, via [Ollama](https://ollama.com):
+
+```sh
+ollama pull mxbai-embed-large   # embedding model (1024d, default)
+ollama pull qwen3.6:35b-a3b     # chat model (default; override via --chat or config)
+
+chv index --deep    # Bash tool_use blocks are only indexed at --deep
+chv embed           # embed all not-yet-embedded eligible message blocks
+chv ask "when did I set up the homebrew tap"
+chv patterns --kind all --top 10 --out ./candidates
+```
+
+Requires an Ollama server reachable at `http://localhost:11434` (override with `--ollama` or `ollama_url` in `index.json`). Nothing else leaves your machine.
+
 The index DB is stored at `${XDG_DATA_HOME:-~/.local/share}/chv/chv.db`.
 
 ## Commands
@@ -59,11 +75,14 @@ Plan files (`PLAN.md`, `PROGRESS.md` by default) are discovered with [`fd`](http
     "~/src/my-project",
     "~/src/other-repo"
   ],
-  "patterns": ["PLAN.md", "PROGRESS.md"]
+  "patterns": ["PLAN.md", "PROGRESS.md"],
+  "embed_model": "mxbai-embed-large",
+  "chat_model": "qwen3.6:35b-a3b",
+  "ollama_url": "http://localhost:11434"
 }
 ```
 
-`directories` lists extra project roots to scan (always in addition to `~/.claude`). `patterns` are basename matches, case-insensitive. Missing config file uses empty directories and default patterns.
+`directories` lists extra project roots to scan (always in addition to `~/.claude`). `patterns` are basename matches, case-insensitive. `embed_model`, `chat_model`, and `ollama_url` set the defaults used by `chv embed`/`ask`/`patterns` (all optional — shown values are also the built-in defaults); CLI flags override them. Missing config file uses empty directories and default patterns.
 
 **Cron** — install a default every-4-hours index job (Go crontab helpers, invoked via Make):
 
@@ -77,6 +96,12 @@ Override the binary or schedule:
 ```sh
 make install-cron CHV_BIN=/path/to/chv
 go run ./cmd/cronctl install --chv ./chv --schedule "0 */3 * * *"
+```
+
+Add `--embed` to also run `chv embed` after each indexing pass (requires Ollama running):
+
+```sh
+go run ./cmd/cronctl install --chv ./chv --embed
 ```
 
 Logs append to `${XDG_DATA_HOME:-~/.local/share}/chv/index.log`. The crontab line is tagged `# chv-managed` so re-install replaces any prior chv entry.
@@ -169,6 +194,63 @@ a1b2c3d4-…  Fix login redirect [prompt-only]
 Fuzzy = prefix + edit-distance-1 variants, not full typo tolerance. AND still requires terms in the **same indexed message row** (not across messages in a session).
 
 Sessions without a transcript on disk are shown with a `[prompt-only]` tag. Plan files appear with `[plan]`. Results include their source label: `[Claude Code]`, `[Claude Desktop]`, `[Cursor]`, `[OpenCode]`, or `[Codex]`.
+
+### `chv embed`
+
+Embeds indexed message blocks with a local Ollama model, storing vectors in the `embeddings` table. Eligible blocks: user and assistant `text`, and Bash `tool_use` commands (assistant text truncated to 2000 runes; blocks under 15 runes are skipped). Resumable — interrupting only loses the in-flight batch, since embeddings commit per batch; rerunning only embeds what's still missing.
+
+```
+--db PATH       override DB file location
+--model NAME    embedding model (default: index.json embed_model, else mxbai-embed-large)
+--ollama URL    Ollama base URL (default: index.json ollama_url, else http://localhost:11434)
+--batch N       embed batch size (default 32)
+--vendor NAME   filter by vendor
+--project PATH  filter by project path
+--force         re-embed even if already embedded
+--limit N       max units to embed (0 = no limit)
+```
+
+Re-indexing a session (`chv index`) preserves embeddings for message blocks whose text is unchanged, so a routine reindex doesn't force re-embedding everything.
+
+### `chv ask <question>`
+
+Semantic search + retrieval-augmented answer over your own indexed history. Embeds the question, retrieves the nearest message blocks (deduped, max 3 per session), pulls ±2 neighboring blocks for context, and asks the chat model to answer citing `[n]` excerpt numbers.
+
+```
+--db PATH       override DB file location
+--model NAME    embedding model
+--chat NAME     chat model (default: index.json chat_model, else qwen3.6:35b-a3b)
+--ollama URL    Ollama base URL
+--k N           number of hits (default 12)
+--vendor NAME   filter by vendor
+--project PATH  filter by project path
+--since DUR     only messages since duration ago, e.g. 30d
+--no-llm        semantic search only — print hits, skip the chat model
+--json          output JSON
+```
+
+### `chv patterns`
+
+Mines the embedded corpus for repeated behavior and drafts candidates:
+
+- **Skill candidates** — clusters repeated user-prompt intents (k-means over embeddings), then asks the chat model to draft a name, intent, trigger phrases, and outline per cluster.
+- **Script candidates** — exact-match Bash command n-grams (2–4 consecutive commands within a session) plus embedding clusters of single commands (catches the same command with different flags), ranked by how many distinct sessions repeat them; trivial single commands (`ls`, `cat`, `pwd`, `git status`) are dropped.
+
+```
+--db PATH       override DB file location
+--model NAME    embedding model
+--chat NAME     chat model
+--ollama URL    Ollama base URL
+--kind KIND     skills|scripts|all (default all)
+--k N           cluster count (0 = auto-pick via approximate silhouette)
+--top N         max candidates per kind (default 15)
+--vendor NAME   filter by vendor
+--project PATH  filter by project path
+--since DUR     only messages since duration ago, e.g. 30d
+--out DIR       write one SKILL-CANDIDATE-<slug>.md / SCRIPT-CANDIDATE-<slug>.md file per candidate
+--json          output JSON instead of markdown
+--no-llm        rank and report clusters without chat-model labeling
+```
 
 ### `chv` (no subcommand)
 
