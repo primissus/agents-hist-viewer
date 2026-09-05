@@ -334,6 +334,10 @@ func vendor(v domain.Vendor) string {
 		return string(domain.VendorCursor)
 	case domain.VendorClaudeDesktop:
 		return string(domain.VendorClaudeDesktop)
+	case domain.VendorOpencode:
+		return string(domain.VendorOpencode)
+	case domain.VendorCodex:
+		return string(domain.VendorCodex)
 	default:
 		return string(domain.VendorClaude)
 	}
@@ -345,6 +349,10 @@ func parseVendor(s string) domain.Vendor {
 		return domain.VendorCursor
 	case domain.VendorClaudeDesktop:
 		return domain.VendorClaudeDesktop
+	case domain.VendorOpencode:
+		return domain.VendorOpencode
+	case domain.VendorCodex:
+		return domain.VendorCodex
 	default:
 		return domain.VendorClaude
 	}

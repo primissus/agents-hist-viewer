@@ -41,7 +41,7 @@ func buildFilterOpts(m Model) []string {
 	case filterType:
 		return []string{"", string(domain.RecordChat), string(domain.RecordPlan)}
 	case filterVendor:
-		return []string{"", string(domain.VendorClaude), string(domain.VendorClaudeDesktop), string(domain.VendorCursor)}
+		return []string{"", string(domain.VendorClaude), string(domain.VendorClaudeDesktop), string(domain.VendorCursor), string(domain.VendorOpencode), string(domain.VendorCodex)}
 	default:
 		seen := make(map[string]bool)
 		var opts []string
@@ -72,7 +72,7 @@ func filterOptLabel(cat filterCategory, value string) string {
 		}
 	case filterVendor:
 		switch domain.Vendor(value) {
-		case domain.VendorClaude, domain.VendorClaudeDesktop, domain.VendorCursor:
+		case domain.VendorClaude, domain.VendorClaudeDesktop, domain.VendorCursor, domain.VendorOpencode, domain.VendorCodex:
 			return domain.VendorLabel(domain.Vendor(value))
 		default:
 			return "All vendors"

@@ -82,8 +82,50 @@ func TestParseViewFormat(t *testing.T) {
 	if got, err := ParseViewFormat("CLAUDE"); err != nil || got != ViewFormatClaude {
 		t.Fatalf("ParseViewFormat(CLAUDE) = %q, %v", got, err)
 	}
+	if got, err := ParseViewFormat("codex"); err != nil || got != ViewFormatCodex {
+		t.Fatalf("ParseViewFormat(codex) = %q, %v", got, err)
+	}
 	if _, err := ParseViewFormat("bogus"); err == nil {
 		t.Fatal("expected unsupported format error")
+	}
+}
+
+func TestViewServiceAutoDetectsCodex(t *testing.T) {
+	path := writeJSONL(t, `{"timestamp":"2026-09-01T10:00:00Z","type":"session_meta","payload":{"id":"thread_1"}}`)
+	var called string
+	svc := NewViewServiceWithCodex(
+		func(ctx context.Context, p string, opts domain.IndexOptions) (domain.SessionDetail, error) {
+			called = "claude"
+			return domain.SessionDetail{}, nil
+		},
+		func(ctx context.Context, p string, opts domain.IndexOptions) (domain.SessionDetail, error) {
+			called = "cursor"
+			return domain.SessionDetail{}, nil
+		},
+		func(ctx context.Context, p string, opts domain.IndexOptions) (domain.SessionDetail, error) {
+			called = "codex"
+			return domain.SessionDetail{Session: domain.Session{ID: "codex:thread_1"}}, nil
+		},
+		domain.DefaultIndexOptions,
+	)
+
+	detail, err := svc.LoadJSONL(t.Context(), path, ViewFormatAuto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if called != "codex" {
+		t.Fatalf("called %q, want codex", called)
+	}
+	if detail.Session.ID != "codex:thread_1" {
+		t.Fatalf("session id = %q", detail.Session.ID)
+	}
+}
+
+func TestViewServiceCodexRequiresLoader(t *testing.T) {
+	path := writeJSONL(t, `{"timestamp":"2026-09-01T10:00:00Z","type":"session_meta","payload":{"id":"thread_1"}}`)
+	svc := NewViewService(nil, nil, domain.DefaultIndexOptions)
+	if _, err := svc.LoadJSONL(t.Context(), path, ViewFormatCodex); err == nil {
+		t.Fatal("expected codex loader not configured error")
 	}
 }
 

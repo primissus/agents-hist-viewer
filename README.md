@@ -1,6 +1,6 @@
-# chv — Claude Code, Claude Desktop & Cursor History Viewer
+# chv — Claude Code, Claude Desktop, Cursor, OpenCode & Codex History Viewer
 
-Globally search across Claude Code, Claude Desktop, and Cursor session transcripts, typed prompts, and plan documents. Find what you said, which session it was in, and browse the full conversation.
+Globally search across Claude Code, Claude Desktop, Cursor, OpenCode, and Codex session transcripts, typed prompts, and plan documents. Find what you said, which session it was in, and browse the full conversation.
 
 ## Build
 
@@ -16,7 +16,7 @@ Requires Go 1.26+. No CGO — pure Go SQLite (`modernc.org/sqlite`).
 ## First run
 
 ```sh
-chv index          # scan Claude Code, Claude Desktop, and Cursor sources
+chv index          # scan Claude Code, Claude Desktop, Cursor, OpenCode, and Codex sources
 chv search "term"  # search immediately from the CLI
 chv view ./chat.jsonl # open one transcript without indexing
 chv                # launch interactive TUI
@@ -28,7 +28,7 @@ The index DB is stored at `${XDG_DATA_HOME:-~/.local/share}/chv/chv.db`.
 
 ### `chv index` / `chv i`
 
-Scans **Claude Code** transcripts, **Claude Desktop** agent-session metadata, typed prompts, and plan markdown, plus **Cursor** agent transcripts and Cursor plan files, into the FTS5 search index. Progress is printed to stderr (`Indexing N/M…`); a summary goes to stdout:
+Scans **Claude Code** transcripts, **Claude Desktop** agent-session metadata, typed prompts, and plan markdown, plus **Cursor** agent transcripts and Cursor plan files, **OpenCode** sessions, and **Codex** rollout transcripts, into the FTS5 search index. Progress is printed to stderr (`Indexing N/M…`); a summary goes to stdout:
 
 ```
 Sessions: 42  Orphaned: 3  Plans: 2  Skipped: 10  Messages: 1284  Elapsed: 1.2s
@@ -42,8 +42,10 @@ Sessions: 42  Orphaned: 3  Plans: 2  Skipped: 10  Messages: 1284  Elapsed: 1.2s
 | `PLAN.md` / `PROGRESS.md` under `~/.claude` + `index.json` dirs | `claude` | plan |
 | `~/.cursor/projects/.../agent-transcripts` | `cursor` | chat |
 | `~/.cursor/plans/*.plan.md` | `cursor` | plan |
+| `~/.local/share/opencode/opencode.db` (XDG-aware, read-only) | `opencode` | chat |
+| `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` | `codex` | chat |
 
-Session IDs are namespaced to avoid collisions: Claude Code chats use the transcript UUID; Claude Desktop agent sessions reuse the linked Claude Code transcript UUID so they replace the plain Claude Code metadata instead of duplicating the same conversation; Claude plans use `plan:<hash>`; Cursor chats use `cursor:<chat-id>`; Cursor plans use `cursor-plan:<hash>`.
+Session IDs are namespaced to avoid collisions: Claude Code chats use the transcript UUID; Claude Desktop agent sessions reuse the linked Claude Code transcript UUID so they replace the plain Claude Code metadata instead of duplicating the same conversation; Claude plans use `plan:<hash>`; Cursor chats use `cursor:<chat-id>`; Cursor plans use `cursor-plan:<hash>`; OpenCode sessions use `opencode:<session-id>`; Codex threads use `codex:<thread-id>`.
 
 **Upgrading** — schema changes (e.g. adding `vendor`) are applied automatically when you run `chv index`. If you upgraded chv and the TUI errors on an old DB, run `chv index` once before searching.
 
@@ -119,16 +121,16 @@ During indexing, tool-use and tool-result payloads are truncated to `--shrink-ca
 
 ### `chv view <path.jsonl>` / `chv v <path.jsonl>`
 
-Opens a single Claude Code or Cursor transcript JSONL directly in the thread TUI. This does not require the index DB and does not write anything to the index:
+Opens a single Claude Code, Cursor, or Codex transcript JSONL directly in the thread TUI. This does not require the index DB and does not write anything to the index:
 
 ```sh
 chv view "/Users/me/.claude/projects/-Users-me-src-app/session-id.jsonl"
 ```
 
-By default chv auto-detects the transcript format from the first valid JSONL record. Use `--format claude` or `--format cursor` to force a parser.
+By default chv auto-detects the transcript format from the first valid JSONL record. Use `--format claude`, `--format cursor`, or `--format codex` to force a parser.
 
 ```
---format FORMAT   auto, claude, or cursor (default auto)
+--format FORMAT   auto, claude, cursor, or codex (default auto)
 --shrink-cap N    rune cap for tool payloads (default 2000)
 --no-shrink       disable payload truncation (tool blocks verbatim)
 ```
@@ -166,7 +168,7 @@ a1b2c3d4-…  Fix login redirect [prompt-only]
 
 Fuzzy = prefix + edit-distance-1 variants, not full typo tolerance. AND still requires terms in the **same indexed message row** (not across messages in a session).
 
-Sessions without a transcript on disk are shown with a `[prompt-only]` tag. Plan files appear with `[plan]`. Results include their source label: `[Claude Code]`, `[Claude Desktop]`, or `[Cursor]`.
+Sessions without a transcript on disk are shown with a `[prompt-only]` tag. Plan files appear with `[plan]`. Results include their source label: `[Claude Code]`, `[Claude Desktop]`, `[Cursor]`, `[OpenCode]`, or `[Codex]`.
 
 ### `chv` (no subcommand)
 
@@ -174,7 +176,7 @@ Launches the interactive TUI. Exits with a helpful message if the DB hasn't been
 
 On launch, the TUI shows the **100 most recent** sessions (all vendors unless filters are active). That list is **not** the full index — press `/` to search **all indexed** chats and plans via FTS5 (up to **500** unique sessions per query). TUI search uses the same query syntax as `chv search`; use `term~` or a leading `~query` for fuzzy matching. Search queries are saved to `${XDG_DATA_HOME:-~/.local/share}/chv/search_history` (last 100, deduplicated).
 
-Press `f` to filter by **path**, **type** (chat/plan), or **vendor** (Claude Code/Claude Desktop/Cursor) when the current result list is non-empty. Default is all vendors. On the home view, path/type/vendor filters are applied server-side; on search results they filter client-side. Press `g` to group the displayed results by path, vendor, vendor+path, or off. Press `c` on the results view to clear a search and return to recent threads; press `c` inside the filter modal to clear only the active category without closing the modal.
+Press `f` to filter by **path**, **type** (chat/plan), or **vendor** (Claude Code/Claude Desktop/Cursor/OpenCode/Codex) when the current result list is non-empty. Default is all vendors. On the home view, path/type/vendor filters are applied server-side; on search results they filter client-side. Press `g` to group the displayed results by path, vendor, vendor+path, or off. Press `c` on the results view to clear a search and return to recent threads; press `c` inside the filter modal to clear only the active category without closing the modal.
 
 Set `CHV_NO_COLOR_QUERY=1` to skip terminal palette detection and use ANSI fallback colors.
 
@@ -258,10 +260,12 @@ Sidechain (subagent) messages are tagged `[sidechain]` in the detail view. Deleg
 | `~/.cursor/projects/<project>/agent-transcripts/<chat-id>/<chat-id>.jsonl` | Cursor agent chat transcripts |
 | `~/.cursor/projects/<project>/agent-transcripts/<chat-id>/subagents/*.jsonl` | Cursor subagent sidechains |
 | `~/.cursor/plans/*.plan.md` | Cursor plan markdown files |
+| `~/.local/share/opencode/opencode.db` | OpenCode sessions (TUI + Desktop share one DB; opened read-only) |
+| `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` | Codex rollout transcripts |
 
 Claude plan discovery scans `~/.claude` plus any `index.json` directories for configured basename patterns. It does not currently read Claude `plansDirectory` settings; add those directories to `index.json` if they live outside `~/.claude`.
 
-Session titles: Claude transcripts use `custom-title` / `ai-title`; Cursor chats use the first user message (truncated); plans use file headings or frontmatter.
+Session titles: Claude transcripts use `custom-title` / `ai-title`; Cursor chats use the first user message (truncated); OpenCode sessions use the stored title (falling back to the first user message); Codex threads use the first user message; plans use file headings or frontmatter.
 
 ## Result tags
 
@@ -271,6 +275,8 @@ Session titles: Claude transcripts use `custom-title` / `ai-title`; Cursor chats
 | `[plan]` | Claude plan markdown |
 | `[cursor]` | Cursor chat transcript |
 | `[cursor plan]` | Cursor plan markdown |
+| `[opencode]` | OpenCode session |
+| `[codex]` | Codex rollout thread |
 
 Combined tags appear in CLI output (e.g. `[cursor plan]`). The TUI shows similar badges on result titles.
 

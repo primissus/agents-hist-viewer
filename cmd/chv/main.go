@@ -11,7 +11,9 @@ import (
 	"time"
 
 	desktoptranscript "claude-code-hist-viewer/internal/adapter/claudedesktop/transcript"
+	codextranscript "claude-code-hist-viewer/internal/adapter/codex/transcript"
 	cursortranscript "claude-code-hist-viewer/internal/adapter/cursor/transcript"
+	opencodetranscript "claude-code-hist-viewer/internal/adapter/opencode/transcript"
 	"claude-code-hist-viewer/internal/adapter/history"
 	"claude-code-hist-viewer/internal/adapter/plan"
 	"claude-code-hist-viewer/internal/adapter/sqlite"
@@ -136,11 +138,13 @@ func cmdIndex(args []string) {
 		opts,
 	)
 	cursorSrc := cursortranscript.NewSource(filepath.Join(home, ".cursor", "projects"), opts)
+	opencodeSrc := opencodetranscript.NewSource(config.OpenCodeDBPath(), opts)
+	codexSrc := codextranscript.NewSource(config.CodexSessionsDir(), opts)
 	log := history.NewLog(filepath.Join(home, ".claude", "history.jsonl"))
 	plans := plan.NewSource(home, indexCfg)
 
 	svc := app.NewIndexServiceMulti(
-		[]domain.TranscriptSource{src, desktopSrc, cursorSrc},
+		[]domain.TranscriptSource{src, desktopSrc, cursorSrc, opencodeSrc, codexSrc},
 		log,
 		[]domain.PlanSource{plans},
 		repo,
@@ -213,13 +217,13 @@ func cmdSearch(args []string) {
 
 func cmdView(args []string) {
 	fs := flag.NewFlagSet("view", flag.ExitOnError)
-	formatFlag := fs.String("format", "auto", "transcript format: auto, claude, or cursor")
+	formatFlag := fs.String("format", "auto", "transcript format: auto, claude, cursor, or codex")
 	shrinkCap := fs.Int("shrink-cap", 2000, "rune cap for tool payloads")
 	noShrink := fs.Bool("no-shrink", false, "disable shrink transform")
 	fs.Parse(args)
 
 	if fs.NArg() != 1 {
-		fmt.Fprintln(os.Stderr, "usage: chv view [--format auto|claude|cursor] <path.jsonl>")
+		fmt.Fprintln(os.Stderr, "usage: chv view [--format auto|claude|cursor|codex] <path.jsonl>")
 		os.Exit(1)
 	}
 	format, err := app.ParseViewFormat(*formatFlag)
@@ -236,7 +240,7 @@ func cmdView(args []string) {
 		},
 		Depth: domain.IndexDepthDeep,
 	}
-	svc := app.NewViewService(transcript.LoadFile, cursortranscript.LoadFile, opts)
+	svc := app.NewViewServiceWithCodex(transcript.LoadFile, cursortranscript.LoadFile, codextranscript.LoadFile, opts)
 	detail, err := svc.LoadJSONL(context.Background(), fs.Arg(0), format)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "view: %v\n", err)

@@ -20,15 +20,37 @@ func ManualFilesDir() string {
 	return xdgChv("manual")
 }
 
-func xdgChv(name string) string {
-	base := os.Getenv("XDG_DATA_HOME")
+// OpenCodeDBPath returns the path to the OpenCode SQLite database (XDG-aware).
+func OpenCodeDBPath() string {
+	return filepath.Join(xdgDataHome(), "opencode", "opencode.db")
+}
+
+// CodexSessionsDir returns the Codex sessions directory ($CODEX_HOME or ~/.codex).
+func CodexSessionsDir() string {
+	base := os.Getenv("CODEX_HOME")
 	if base == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			base = "."
 		} else {
-			base = filepath.Join(home, ".local", "share")
+			base = filepath.Join(home, ".codex")
 		}
 	}
-	return filepath.Join(base, "chv", name)
+	return filepath.Join(base, "sessions")
+}
+
+func xdgChv(name string) string {
+	return filepath.Join(xdgDataHome(), "chv", name)
+}
+
+func xdgDataHome() string {
+	base := os.Getenv("XDG_DATA_HOME")
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "."
+		}
+		return filepath.Join(home, ".local", "share")
+	}
+	return base
 }

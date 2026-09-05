@@ -559,3 +559,56 @@ func TestVendorPersistedAndFiltered(t *testing.T) {
 		t.Fatalf("recent vendor filter: %+v", cursorOnly)
 	}
 }
+
+func TestNewVendorsPersistedAndFiltered(t *testing.T) {
+	r := openTemp(t)
+	ctx := context.Background()
+
+	opencode := makeSession("opencode:ses1", "opencode chat")
+	opencode.Vendor = domain.VendorOpencode
+	codex := makeSession("codex:thread1", "codex chat")
+	codex.Vendor = domain.VendorCodex
+
+	for _, s := range []domain.Session{opencode, codex} {
+		msgs := []domain.Message{makeMsg(s.ID, s.ID+"-m", 0, "new vendor keyword "+s.ID)}
+		if err := r.ReplaceSession(ctx, s, msgs); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	detail, err := r.SessionByID(ctx, "opencode:ses1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Session.Vendor != domain.VendorOpencode {
+		t.Errorf("opencode detail vendor: %q", detail.Session.Vendor)
+	}
+
+	hits, err := r.Search(ctx, "new vendor keyword", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vendors := map[domain.Vendor]bool{}
+	for _, h := range hits {
+		vendors[h.Vendor] = true
+	}
+	if !vendors[domain.VendorOpencode] || !vendors[domain.VendorCodex] {
+		t.Errorf("expected both new vendors in search hits, got %v", vendors)
+	}
+
+	opencodeOnly, err := r.RecentSessions(ctx, domain.RecentQuery{Limit: 10, Vendor: domain.VendorOpencode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(opencodeOnly) != 1 || opencodeOnly[0].Vendor != domain.VendorOpencode {
+		t.Fatalf("recent opencode filter: %+v", opencodeOnly)
+	}
+
+	codexOnly, err := r.RecentSessions(ctx, domain.RecentQuery{Limit: 10, Vendor: domain.VendorCodex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(codexOnly) != 1 || codexOnly[0].Vendor != domain.VendorCodex {
+		t.Fatalf("recent codex filter: %+v", codexOnly)
+	}
+}

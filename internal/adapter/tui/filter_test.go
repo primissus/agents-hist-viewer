@@ -24,7 +24,7 @@ func TestClearFilterCategoryVendor(t *testing.T) {
 	m := Model{
 		filterCat:    filterVendor,
 		filterVendor: domain.VendorCursor,
-		filterOpts:   []string{"", string(domain.VendorClaude), string(domain.VendorClaudeDesktop), string(domain.VendorCursor)},
+		filterOpts:   []string{"", string(domain.VendorClaude), string(domain.VendorClaudeDesktop), string(domain.VendorCursor), string(domain.VendorOpencode), string(domain.VendorCodex)},
 	}
 	clearFilterCategory(&m)
 	if m.filterVendor != "" {
@@ -44,6 +44,32 @@ func TestFilterOptLabel(t *testing.T) {
 	}
 	if got := filterOptLabel(filterVendor, string(domain.VendorClaudeDesktop)); got != "Claude Desktop" {
 		t.Errorf("got %q", got)
+	}
+	if got := filterOptLabel(filterVendor, string(domain.VendorOpencode)); got != "OpenCode" {
+		t.Errorf("got %q", got)
+	}
+	if got := filterOptLabel(filterVendor, string(domain.VendorCodex)); got != "Codex" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestBuildFilterOptsVendorIncludesNewVendors(t *testing.T) {
+	m := Model{filterCat: filterVendor}
+	opts := buildFilterOpts(m)
+	for _, want := range []string{
+		string(domain.VendorOpencode),
+		string(domain.VendorCodex),
+	} {
+		found := false
+		for _, o := range opts {
+			if o == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("vendor option %q missing from %v", want, opts)
+		}
 	}
 }
 

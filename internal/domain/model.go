@@ -42,6 +42,8 @@ const (
 	VendorClaude        Vendor = "claude"
 	VendorClaudeDesktop Vendor = "claude-desktop"
 	VendorCursor        Vendor = "cursor"
+	VendorOpencode      Vendor = "opencode"
+	VendorCodex         Vendor = "codex"
 )
 
 func VendorLabel(v Vendor) string {
@@ -50,6 +52,10 @@ func VendorLabel(v Vendor) string {
 		return "Cursor"
 	case VendorClaudeDesktop:
 		return "Claude Desktop"
+	case VendorOpencode:
+		return "OpenCode"
+	case VendorCodex:
+		return "Codex"
 	default:
 		return "Claude Code"
 	}

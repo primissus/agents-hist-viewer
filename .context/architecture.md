@@ -1,13 +1,13 @@
 # Architecture
 
 ## In one sentence
-`chv` indexes Claude Code, Claude Desktop, and Cursor session transcripts plus plan markdown files into a local SQLite FTS5 database, and provides a Bubble Tea TUI + CLI for full-text searching and viewing them.
+`chv` indexes Claude Code, Claude Desktop, Cursor, OpenCode, and Codex session transcripts plus plan markdown files into a local SQLite FTS5 database, and provides a Bubble Tea TUI + CLI for full-text searching and viewing them.
 
 ## Stack
 - Language / runtime: Go 1.26+ (module `claude-code-hist-viewer`), no CGO
 - Main framework: charmbracelet bubbletea (TUI), bubbles, lipgloss
 - Database: SQLite via `modernc.org/sqlite` (pure Go), FTS5 with `unicode61 remove_diacritics 2` tokenizer
-- External services: none — reads local files only (`~/.claude`, `~/.cursor`, XDG dirs)
+- External services: none — reads local files only (`~/.claude`, `~/.cursor`, `~/.codex`/`$CODEX_HOME`, XDG dirs, OpenCode SQLite DB)
 
 ## Folder map
 - `cmd/chv/` → CLI wiring, flags, stdout/stderr
@@ -19,6 +19,8 @@
 - `internal/adapter/claudedesktop/transcript/` → Claude Desktop transcripts
 - `internal/adapter/cursor/transcript/` → Cursor `agent-transcripts/<id>/<id>.jsonl` + `subagents/*.jsonl`
 - `internal/adapter/cursor/plan/` → Cursor `~/.cursor/plans/*.plan.md`
+- `internal/adapter/codex/transcript/` → Codex `$CODEX_HOME/sessions/**/rollout-*.jsonl` envelopes
+- `internal/adapter/opencode/transcript/` → OpenCode `opencode.db` (read-only SQLite)
 - `internal/adapter/history/` → `~/.claude/history.jsonl` typed prompts, resolves `[Pasted text …]` placeholders
 - `internal/adapter/plan/` → Claude `PLAN.md`/`PROGRESS.md` scan (fd/index.json dirs) + manual `FromFile`
 - `internal/adapter/claudesettings/` → reads Claude `plansDirectory` settings (not wired into indexing yet)

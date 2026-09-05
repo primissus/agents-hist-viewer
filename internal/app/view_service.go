@@ -18,6 +18,7 @@ const (
 	ViewFormatAuto   ViewFormat = "auto"
 	ViewFormatClaude ViewFormat = "claude"
 	ViewFormatCursor ViewFormat = "cursor"
+	ViewFormatCodex  ViewFormat = "codex"
 )
 
 type TranscriptFileLoader func(context.Context, string, domain.IndexOptions) (domain.SessionDetail, error)
@@ -25,6 +26,7 @@ type TranscriptFileLoader func(context.Context, string, domain.IndexOptions) (do
 type ViewService struct {
 	claudeLoader TranscriptFileLoader
 	cursorLoader TranscriptFileLoader
+	codexLoader  TranscriptFileLoader
 	opts         domain.IndexOptions
 }
 
@@ -32,6 +34,15 @@ func NewViewService(claudeLoader, cursorLoader TranscriptFileLoader, opts domain
 	return &ViewService{
 		claudeLoader: claudeLoader,
 		cursorLoader: cursorLoader,
+		opts:         opts,
+	}
+}
+
+func NewViewServiceWithCodex(claudeLoader, cursorLoader, codexLoader TranscriptFileLoader, opts domain.IndexOptions) *ViewService {
+	return &ViewService{
+		claudeLoader: claudeLoader,
+		cursorLoader: cursorLoader,
+		codexLoader:  codexLoader,
 		opts:         opts,
 	}
 }
@@ -44,8 +55,10 @@ func ParseViewFormat(s string) (ViewFormat, error) {
 		return ViewFormatClaude, nil
 	case ViewFormatCursor:
 		return ViewFormatCursor, nil
+	case ViewFormatCodex:
+		return ViewFormatCodex, nil
 	default:
-		return "", fmt.Errorf("unsupported format %q (want auto, claude, or cursor)", s)
+		return "", fmt.Errorf("unsupported format %q (want auto, claude, cursor, or codex)", s)
 	}
 }
 
@@ -86,6 +99,11 @@ func (s *ViewService) LoadJSONL(ctx context.Context, filePath string, format Vie
 			return domain.SessionDetail{}, fmt.Errorf("cursor loader is not configured")
 		}
 		return s.cursorLoader(ctx, absPath, s.opts)
+	case ViewFormatCodex:
+		if s.codexLoader == nil {
+			return domain.SessionDetail{}, fmt.Errorf("codex loader is not configured")
+		}
+		return s.codexLoader(ctx, absPath, s.opts)
 	default:
 		return domain.SessionDetail{}, fmt.Errorf("unsupported format %q", format)
 	}
@@ -114,6 +132,9 @@ func detectJSONLFormat(filePath string) (ViewFormat, error) {
 		if err := json.Unmarshal([]byte(line), &probe); err != nil {
 			continue
 		}
+		if isCodexEnvelope(probe.Type) {
+			return ViewFormatCodex, nil
+		}
 		if probe.SessionID != "" || len(probe.Type) > 0 {
 			return ViewFormatClaude, nil
 		}
@@ -125,4 +146,23 @@ func detectJSONLFormat(filePath string) (ViewFormat, error) {
 		return "", err
 	}
 	return "", fmt.Errorf("could not detect transcript format for %s", filePath)
+}
+
+// isCodexEnvelope reports whether a JSONL `type` field is a Codex rollout
+// envelope type (session_meta / response_item / event_msg / turn_context /
+// compacted), which distinguishes it from Claude/Cursor transcripts.
+func isCodexEnvelope(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var typ string
+	if err := json.Unmarshal(raw, &typ); err != nil {
+		return false
+	}
+	switch typ {
+	case "session_meta", "response_item", "event_msg", "turn_context", "compacted":
+		return true
+	default:
+		return false
+	}
 }

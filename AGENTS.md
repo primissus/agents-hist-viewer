@@ -1,6 +1,6 @@
 # Agent instructions — chv
 
-Claude Code & Cursor History Viewer (`chv`): Go CLI + Bubble Tea TUI. Indexes Claude Code + Cursor transcripts, typed prompts, and plan markdown → SQLite FTS5 for global search.
+Claude Code, Cursor, OpenCode & Codex History Viewer (`chv`): Go CLI + Bubble Tea TUI. Indexes Claude Code, Cursor, OpenCode, and Codex transcripts, typed prompts, and plan markdown → SQLite FTS5 for global search.
 
 User docs: [README.md](README.md). File for coding agents.
 
@@ -41,6 +41,8 @@ internal/
     transcript/       ~/.claude/projects JSONL
     cursor/transcript ~/.cursor/projects agent-transcripts JSONL
     cursor/plan       ~/.cursor/plans/*.plan.md
+    codex/transcript  $CODEX_HOME/sessions rollout JSONL
+    opencode/transcript opencode.db (read-only SQLite)
     history/          ~/.claude/history.jsonl
     plan/             Claude PLAN.md/PROGRESS.md (fd scan + index.json dirs)
     sqlite/           FTS5 repository + inline schema migrations
@@ -61,12 +63,12 @@ New I/O/storage backends implement these interfaces; logic stays in `internal/ap
 
 1. **Index** (`IndexService.Run`): union sessions from all `TranscriptSource` adapters + orphaned history-only sessions → `ReplaceSession` per ID (full replace, idempotent). Then index Claude plans (fd/config) and Cursor plans (`~/.cursor/plans`), with content-hash skip via `file_hashes`.
 2. **Search** (`SearchService`): trims and compiles user query syntax (`AND`/`OR`/groups/phrases/NOT/fuzzy) to FTS5; empty query returns nil.
-3. **View** (`ViewService`): validates/detects a single Claude/Cursor JSONL transcript and builds `SessionDetail` directly; no DB writes.
+3. **View** (`ViewService`): validates/detects a single Claude/Cursor/Codex JSONL transcript and builds `SessionDetail` directly; no DB writes.
 4. **TUI** (`tui.Model`): home loads 100 recent sessions (`RecentQuery` supports path/type/vendor filters); `/` search hits full FTS (limit 500 unique sessions); query history in `config.SearchHistoryPath()`. `NewDetailApp` opens a prebuilt thread for `chv view`.
 
 Index applies `domain.Shrink` to tool payloads (configurable cap; images dropped). Deep mode indexes text/thinking verbatim; quick mode indexes user text, tool results, and plans.
 
-**Vendors** — `domain.Vendor`: `claude` (default), `cursor`. Stored on `sessions.vendor`. Empty filter = all vendors. Session ID prefixes: `cursor:`, `cursor-plan:`, `plan:`.
+**Vendors** — `domain.Vendor`: `claude` (default), `claude-desktop`, `cursor`, `opencode`, `codex`. Stored on `sessions.vendor`. Empty filter = all vendors. Session ID prefixes: `cursor:`, `cursor-plan:`, `opencode:`, `codex:`, `plan:`.
 
 **Schema migrations** — `sqlite.Repo.Init()` runs `CREATE TABLE IF NOT EXISTS` plus `ALTER TABLE` for legacy DBs. Migrations must add columns before indexes on those columns. `Init` is called from `IndexService` on index; users upgrade via `chv index`.
 
@@ -85,6 +87,8 @@ Index applies `domain.Shrink` to tool payloads (configurable cap; images dropped
 | `adapter/transcript` | `~/.claude/projects/<proj>/<id>.jsonl`, sidechains. `VendorClaude`. Title from `custom-title`/`ai-title`. |
 | `adapter/cursor/transcript` | `~/.cursor/projects/<proj>/agent-transcripts/<id>/<id>.jsonl` + `subagents/*.jsonl`. IDs `cursor:<id>`. Project path decoded from folder name. |
 | `adapter/cursor/plan` | `~/.cursor/plans/*.plan.md`. IDs `cursor-plan:<hash>`. Title from frontmatter `name`, then `# Heading`, then filename. |
+| `adapter/codex/transcript` | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` envelopes. IDs `codex:<thread-id>`. Title from first user text. `LoadFile` for `chv view`; size+mtime fingerprint. |
+| `adapter/opencode/transcript` | `opencode.db` read-only via `file:<path>?mode=ro`. Root sessions only (`parent_id IS NULL`); children → `IsSidechain`. IDs `opencode:<ses_id>`. Fingerprint = `time_updated` + message count. |
 | `adapter/history` | Resolves `[Pasted text …]` placeholders via `pastedContents`. |
 | `adapter/plan` | fd/walk scan for Claude `PLAN.md`/`PROGRESS.md` under `~/.claude` + configured `index.json` directories; `PlanSource.PlanPaths`. Manual `FromFile` for `chv index <file>`. |
 | `adapter/claudesettings` | Reads Claude `plansDirectory` settings but is not wired into indexing yet; document `index.json` for external plan directories. |
