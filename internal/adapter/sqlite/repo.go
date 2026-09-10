@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"claude-code-hist-viewer/internal/domain"
@@ -295,28 +296,42 @@ WHERE 1=1`
 	return hits, rows.Err()
 }
 
+// sessionColumns is the column list shared by queries that scan into a
+// domain.Session via scanSession.
+const sessionColumns = `id,title,project_path,git_branch,started_at,ended_at,message_count,file_path,has_transcript,record_kind,vendor`
+
+// scanSession scans one row shaped like sessionColumns into a domain.Session.
+func scanSession(row rowScanner) (domain.Session, error) {
+	var s domain.Session
+	var startedAt, endedAt, recordKindStr, vendorStr string
+	var hasTranscript int
+	err := row.Scan(
+		&s.ID, &s.Title,
+		&s.ProjectPath, &s.GitBranch,
+		&startedAt, &endedAt,
+		&s.MessageCount, &s.FilePath, &hasTranscript, &recordKindStr, &vendorStr,
+	)
+	if err != nil {
+		return s, err
+	}
+	s.HasTranscript = hasTranscript != 0
+	s.RecordKind = parseRecordKind(recordKindStr)
+	s.Vendor = parseVendor(vendorStr)
+	s.StartedAt, _ = time.Parse(time.RFC3339Nano, startedAt)
+	s.EndedAt, _ = time.Parse(time.RFC3339Nano, endedAt)
+	return s, nil
+}
+
 func (r *Repo) SessionByID(ctx context.Context, id string) (domain.SessionDetail, error) {
 	var detail domain.SessionDetail
 
 	row := r.db.QueryRowContext(ctx,
-		`SELECT id,title,project_path,git_branch,started_at,ended_at,message_count,file_path,has_transcript,record_kind,vendor
-		 FROM sessions WHERE id = ?`, id)
-	var startedAt, endedAt, recordKindStr, vendorStr string
-	var hasTranscript int
-	err := row.Scan(
-		&detail.Session.ID, &detail.Session.Title,
-		&detail.Session.ProjectPath, &detail.Session.GitBranch,
-		&startedAt, &endedAt,
-		&detail.Session.MessageCount, &detail.Session.FilePath, &hasTranscript, &recordKindStr, &vendorStr,
-	)
+		`SELECT `+sessionColumns+` FROM sessions WHERE id = ?`, id)
+	session, err := scanSession(row)
 	if err != nil {
 		return detail, err
 	}
-	detail.Session.HasTranscript = hasTranscript != 0
-	detail.Session.RecordKind = parseRecordKind(recordKindStr)
-	detail.Session.Vendor = parseVendor(vendorStr)
-	detail.Session.StartedAt, _ = time.Parse(time.RFC3339Nano, startedAt)
-	detail.Session.EndedAt, _ = time.Parse(time.RFC3339Nano, endedAt)
+	detail.Session = session
 
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT uuid,COALESCE(parent_uuid,''),session_id,role,kind,COALESCE(tool_name,''),
@@ -335,6 +350,39 @@ func (r *Repo) SessionByID(ctx context.Context, id string) (domain.SessionDetail
 		detail.Messages = append(detail.Messages, m)
 	}
 	return detail, rows.Err()
+}
+
+// SessionsByIDs returns header rows (no messages) for the given session IDs,
+// keyed by ID. IDs with no matching session are silently absent from the
+// result, not an error.
+func (r *Repo) SessionsByIDs(ctx context.Context, ids []string) (map[string]domain.Session, error) {
+	result := make(map[string]domain.Session)
+	if len(ids) == 0 {
+		return result, nil
+	}
+
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT `+sessionColumns+` FROM sessions WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		s, err := scanSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		result[s.ID] = s
+	}
+	return result, rows.Err()
 }
 
 func (r *Repo) GetFileHash(ctx context.Context, path string) (string, bool, error) {

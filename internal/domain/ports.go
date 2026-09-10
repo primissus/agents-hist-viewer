@@ -35,6 +35,7 @@ type SearchRepository interface {
 	Search(ctx context.Context, query string, limit int) ([]SearchHit, error)
 	RecentSessions(ctx context.Context, q RecentQuery) ([]SearchHit, error)
 	SessionByID(ctx context.Context, id string) (SessionDetail, error)
+	SessionsByIDs(ctx context.Context, ids []string) (map[string]Session, error)
 	Close() error
 }
 
@@ -79,4 +80,11 @@ type EmbeddingRepository interface {
 	MessageByRowID(ctx context.Context, rowid int64) (Message, error)
 	Neighbors(ctx context.Context, sessionID string, seq, radius int) ([]Message, error)
 	BashUnits(ctx context.Context, f EmbedFilter) ([]EmbedUnit, error)
+}
+
+// SummaryRepository caches per-session, per-model generated summaries.
+type SummaryRepository interface {
+	InitSummaries(ctx context.Context) error
+	GetSummary(ctx context.Context, sessionID, model string) (Summary, bool, error)
+	PutSummary(ctx context.Context, s Summary) error
 }

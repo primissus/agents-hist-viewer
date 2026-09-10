@@ -327,6 +327,50 @@ func TestSessionByIDOrderedBySeq(t *testing.T) {
 	}
 }
 
+func TestSessionsByIDs(t *testing.T) {
+	r := openTemp(t)
+	ctx := context.Background()
+
+	s1 := makeSession("s1", "first")
+	s2 := makeSession("s2", "second")
+	if err := r.ReplaceSession(ctx, s1, []domain.Message{makeMsg("s1", "m1", 0, "hello")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ReplaceSession(ctx, s2, []domain.Message{makeMsg("s2", "m2", 0, "world")}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := r.SessionsByIDs(ctx, []string{"s1", "s2", "missing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 sessions, got %d: %+v", len(got), got)
+	}
+	if got["s1"].Title != "first" {
+		t.Errorf("s1 title: got %q", got["s1"].Title)
+	}
+	if got["s2"].Title != "second" {
+		t.Errorf("s2 title: got %q", got["s2"].Title)
+	}
+	if _, ok := got["missing"]; ok {
+		t.Errorf("expected missing id to be absent from result")
+	}
+}
+
+func TestSessionsByIDsEmpty(t *testing.T) {
+	r := openTemp(t)
+	ctx := context.Background()
+
+	got, err := r.SessionsByIDs(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected empty map, got %+v", got)
+	}
+}
+
 func TestReplaceSessionIdempotent(t *testing.T) {
 	r := openTemp(t)
 	ctx := context.Background()

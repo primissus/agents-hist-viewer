@@ -5,18 +5,22 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
+	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	desktoptranscript "claude-code-hist-viewer/internal/adapter/claudedesktop/transcript"
 	codextranscript "claude-code-hist-viewer/internal/adapter/codex/transcript"
 	cursortranscript "claude-code-hist-viewer/internal/adapter/cursor/transcript"
-	opencodetranscript "claude-code-hist-viewer/internal/adapter/opencode/transcript"
 	"claude-code-hist-viewer/internal/adapter/history"
+	mcpadapter "claude-code-hist-viewer/internal/adapter/mcp"
 	"claude-code-hist-viewer/internal/adapter/ollama"
+	opencodetranscript "claude-code-hist-viewer/internal/adapter/opencode/transcript"
 	"claude-code-hist-viewer/internal/adapter/plan"
 	"claude-code-hist-viewer/internal/adapter/sqlite"
 	"claude-code-hist-viewer/internal/adapter/transcript"
@@ -27,6 +31,11 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+// version is the chv build version reported to MCP clients. It is overridden
+// at release time via -ldflags "-X main.version=<tag>" (see .goreleaser.yml);
+// local builds report the default below.
+var version = "0.2.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -46,22 +55,13 @@ func main() {
 		cmdAsk(os.Args[2:])
 	case "patterns":
 		cmdPatterns(os.Args[2:])
+	case "summarize":
+		cmdSummarize(os.Args[2:])
+	case "mcp":
+		cmdMCP(os.Args[2:])
 	default:
 		launchTUI()
 	}
-}
-
-// parseSinceDuration extends time.ParseDuration with a "Nd" (days) suffix,
-// for CLI flags like --since 30d.
-func parseSinceDuration(s string) (time.Duration, error) {
-	if days, ok := strings.CutSuffix(s, "d"); ok {
-		n, err := strconv.Atoi(days)
-		if err != nil {
-			return 0, fmt.Errorf("invalid duration %q", s)
-		}
-		return time.Duration(n) * 24 * time.Hour, nil
-	}
-	return time.ParseDuration(s)
 }
 
 func loadIndexConfigOrExit() config.IndexConfig {
@@ -71,6 +71,47 @@ func loadIndexConfigOrExit() config.IndexConfig {
 		os.Exit(1)
 	}
 	return indexCfg
+}
+
+// ollamaFlags bundles the --model, --chat, and --ollama flags shared by the
+// embed, ask, and patterns subcommands.
+type ollamaFlags struct{ model, chat, url *string }
+
+// addOllamaFlags registers --model, --chat, and --ollama on fs.
+func addOllamaFlags(fs *flag.FlagSet) ollamaFlags {
+	return ollamaFlags{
+		model: fs.String("model", "", "embedding model (default: config or mxbai-embed-large)"),
+		chat:  fs.String("chat", "", "chat model (default: config)"),
+		url:   fs.String("ollama", "", "Ollama base URL (default: config or http://localhost:11434)"),
+	}
+}
+
+// resolve resolves the flags against cfg defaults and constructs an Ollama
+// client, returning the resolved embedding and chat model names alongside it.
+func (f ollamaFlags) resolve(cfg config.IndexConfig) (client *ollama.Client, embedModel, chatModel string) {
+	embedModel = *f.model
+	if embedModel == "" {
+		embedModel = cfg.EmbedModelOrDefault()
+	}
+	chatModel = *f.chat
+	if chatModel == "" {
+		chatModel = cfg.ChatModelOrDefault()
+	}
+	ollamaURL := *f.url
+	if ollamaURL == "" {
+		ollamaURL = cfg.OllamaURLOrDefault()
+	}
+	client = ollama.New(ollamaURL, embedModel, chatModel)
+	return client, embedModel, chatModel
+}
+
+// resolveOllamaURL mirrors the URL-resolution half of ollamaFlags.resolve,
+// for callers that need the URL string without constructing a client.
+func resolveOllamaURL(f ollamaFlags, cfg config.IndexConfig) string {
+	if *f.url != "" {
+		return *f.url
+	}
+	return cfg.OllamaURLOrDefault()
 }
 
 func openDBOrExit(dbFlag string, requireExisting bool) *sqlite.Repo {
@@ -95,8 +136,7 @@ func openDBOrExit(dbFlag string, requireExisting bool) *sqlite.Repo {
 func cmdEmbed(args []string) {
 	fs := flag.NewFlagSet("embed", flag.ExitOnError)
 	dbFlag := fs.String("db", "", "path to DB file (default: XDG)")
-	modelFlag := fs.String("model", "", "embedding model (default: config or mxbai-embed-large)")
-	ollamaFlag := fs.String("ollama", "", "Ollama base URL (default: config or http://localhost:11434)")
+	ollamaFlags := addOllamaFlags(fs)
 	batchFlag := fs.Int("batch", 32, "embed batch size")
 	vendorFlag := fs.String("vendor", "", "filter by vendor")
 	projectFlag := fs.String("project", "", "filter by project path")
@@ -108,15 +148,7 @@ func cmdEmbed(args []string) {
 	repo := openDBOrExit(*dbFlag, true)
 	defer repo.Close()
 
-	model := *modelFlag
-	if model == "" {
-		model = indexCfg.EmbedModelOrDefault()
-	}
-	ollamaURL := *ollamaFlag
-	if ollamaURL == "" {
-		ollamaURL = indexCfg.OllamaURLOrDefault()
-	}
-	client := ollama.New(ollamaURL, model, indexCfg.ChatModelOrDefault())
+	client, _, _ := ollamaFlags.resolve(indexCfg)
 
 	svc := app.NewEmbedService(client, repo)
 	stats, err := svc.Run(context.Background(), app.EmbedOptions{
@@ -139,9 +171,7 @@ func cmdEmbed(args []string) {
 func cmdAsk(args []string) {
 	fs := flag.NewFlagSet("ask", flag.ExitOnError)
 	dbFlag := fs.String("db", "", "path to DB file")
-	modelFlag := fs.String("model", "", "embedding model")
-	chatFlag := fs.String("chat", "", "chat model")
-	ollamaFlag := fs.String("ollama", "", "Ollama base URL")
+	ollamaFlags := addOllamaFlags(fs)
 	kFlag := fs.Int("k", 12, "number of hits")
 	vendorFlag := fs.String("vendor", "", "filter by vendor")
 	projectFlag := fs.String("project", "", "filter by project path")
@@ -160,28 +190,12 @@ func cmdAsk(args []string) {
 	repo := openDBOrExit(*dbFlag, true)
 	defer repo.Close()
 
-	model := *modelFlag
-	if model == "" {
-		model = indexCfg.EmbedModelOrDefault()
-	}
-	chatModel := *chatFlag
-	if chatModel == "" {
-		chatModel = indexCfg.ChatModelOrDefault()
-	}
-	ollamaURL := *ollamaFlag
-	if ollamaURL == "" {
-		ollamaURL = indexCfg.OllamaURLOrDefault()
-	}
-	client := ollama.New(ollamaURL, model, chatModel)
+	client, _, _ := ollamaFlags.resolve(indexCfg)
 
-	var since time.Time
-	if *sinceFlag != "" {
-		d, err := parseSinceDuration(*sinceFlag)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "ask: %v\n", err)
-			os.Exit(1)
-		}
-		since = time.Now().Add(-d)
+	since, err := app.SinceTime(*sinceFlag, time.Now())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ask: %v\n", err)
+		os.Exit(1)
 	}
 
 	var chatSvc domain.ChatModel = client
@@ -214,12 +228,162 @@ func cmdAsk(args []string) {
 	}
 }
 
+// cmdSummarize condenses a session's transcript and, unless --no-llm, asks
+// the chat model for a structured recap. The positional arg is either a
+// session ID (looked up in the DB) or a path ending in .jsonl (loaded
+// directly, no indexing). Summaries print to stdout; status lines go to
+// stderr so a downstream consumer parsing stdout gets clean output.
+func cmdSummarize(args []string) {
+	fs := flag.NewFlagSet("summarize", flag.ExitOnError)
+	dbFlag := fs.String("db", "", "path to DB file (default: XDG)")
+	ollamaFlags := addOllamaFlags(fs)
+	refreshFlag := fs.Bool("refresh", false, "bypass the cached summary and regenerate")
+	noLLMFlag := fs.Bool("no-llm", false, "condense only, no chat model call")
+	jsonFlag := fs.Bool("json", false, "output JSON")
+	maxCharsFlag := fs.Int("max-chars", 0, "condensed-text budget in runes (0 = default)")
+	formatFlag := fs.String("format", "auto", "transcript format for a .jsonl arg: auto, claude, cursor, or codex")
+	fs.Parse(args)
+
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "usage: chv summarize [flags] <session-id | path.jsonl>")
+		os.Exit(1)
+	}
+	arg := fs.Arg(0)
+
+	indexCfg := loadIndexConfigOrExit()
+	client, _, chatModel := ollamaFlags.resolve(indexCfg)
+	var chatSvc domain.ChatModel = client
+	if *noLLMFlag {
+		chatSvc = nil
+	}
+
+	opts := app.SummarizeOptions{Refresh: *refreshFlag, NoLLM: *noLLMFlag, MaxChars: *maxCharsFlag}
+
+	var result app.SummarizeResult
+	var err error
+
+	if strings.HasSuffix(arg, ".jsonl") {
+		format, ferr := app.ParseViewFormat(*formatFlag)
+		if ferr != nil {
+			fmt.Fprintf(os.Stderr, "summarize: %v\n", ferr)
+			os.Exit(1)
+		}
+		viewOpts := domain.IndexOptions{
+			Shrink: domain.ShrinkConfig{Enabled: true, ToolPayloadCap: 2000, DropImages: true},
+			Depth:  domain.IndexDepthDeep,
+		}
+		viewSvc := app.NewViewServiceWithCodex(transcript.LoadFile, cursortranscript.LoadFile, codextranscript.LoadFile, viewOpts)
+		detail, verr := viewSvc.LoadJSONL(context.Background(), arg, format)
+		if verr != nil {
+			fmt.Fprintf(os.Stderr, "summarize: %v\n", verr)
+			os.Exit(1)
+		}
+
+		// Only use the DB-backed cache if a DB already exists on disk —
+		// never create one as a side effect of summarizing a raw file.
+		dbPath := *dbFlag
+		if dbPath == "" {
+			dbPath = config.DBPath()
+		}
+		var store domain.SummaryRepository
+		if _, statErr := os.Stat(dbPath); statErr == nil {
+			repo, openErr := sqlite.Open(dbPath)
+			if openErr != nil {
+				fmt.Fprintf(os.Stderr, "open db: %v\n", openErr)
+				os.Exit(1)
+			}
+			defer repo.Close()
+			store = repo
+		}
+
+		svc := app.NewSummarizeService(chatSvc, chatModel, nil, store)
+		result, err = svc.SummarizeDetail(context.Background(), detail, opts)
+	} else {
+		repo := openDBOrExit(*dbFlag, true)
+		defer repo.Close()
+		svc := app.NewSummarizeService(chatSvc, chatModel, repo, repo)
+		result, err = svc.Summarize(context.Background(), arg, opts)
+	}
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "summarize: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *jsonFlag {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		enc.Encode(result)
+		return
+	}
+
+	if *noLLMFlag {
+		fmt.Println(result.Condensed)
+		fmt.Fprintf(os.Stderr, "(condensed only, no chat model)\n")
+		return
+	}
+
+	fmt.Println(result.Summary)
+	status := "model " + result.Model
+	if result.Cached {
+		status = "cached · model " + result.Model
+	}
+	if !result.CreatedAt.IsZero() {
+		status += " · " + result.CreatedAt.Format("2006-01-02")
+	}
+	fmt.Fprintf(os.Stderr, "(%s)\n", status)
+}
+
+// cmdMCP runs chv as an MCP stdio server, exposing search/summarize tools
+// to MCP clients. stdout is the protocol channel: nothing but the SDK
+// transport may write to it, so all diagnostics go to stderr.
+func cmdMCP(args []string) {
+	// Defensive: any stdlib `log` call reachable from this path must go to
+	// stderr, never stdout, since stdout is the MCP protocol channel.
+	log.SetOutput(os.Stderr)
+
+	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
+	dbFlag := fs.String("db", "", "path to DB file (default: XDG)")
+	ollamaFlags := addOllamaFlags(fs)
+	noLLMFlag := fs.Bool("no-llm", false, "don't construct a chat-capable summarizer; only condensed_only summarize calls work")
+	debugFlag := fs.Bool("debug", false, "log server activity to stderr")
+	fs.Parse(args)
+
+	indexCfg := loadIndexConfigOrExit()
+	repo := openDBOrExit(*dbFlag, true)
+	defer repo.Close()
+
+	client, _, chatModel := ollamaFlags.resolve(indexCfg)
+
+	var chatSvc domain.ChatModel = client
+	if *noLLMFlag {
+		chatSvc = nil
+	}
+
+	deps := mcpadapter.Deps{
+		Search:    app.NewSearchService(repo),
+		Semantic:  app.NewSemanticSearchService(client, repo, repo),
+		Summarize: app.NewSummarizeService(chatSvc, chatModel, repo, repo),
+		Version:   version,
+		OllamaURL: resolveOllamaURL(ollamaFlags, indexCfg),
+	}
+	if *debugFlag {
+		deps.Logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := mcpadapter.Run(ctx, deps); err != nil && ctx.Err() == nil {
+		fmt.Fprintf(os.Stderr, "mcp: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 func cmdPatterns(args []string) {
 	fs := flag.NewFlagSet("patterns", flag.ExitOnError)
 	dbFlag := fs.String("db", "", "path to DB file")
-	modelFlag := fs.String("model", "", "embedding model")
-	chatFlag := fs.String("chat", "", "chat model")
-	ollamaFlag := fs.String("ollama", "", "Ollama base URL")
+	ollamaFlags := addOllamaFlags(fs)
 	kindFlag := fs.String("kind", "all", "skills|scripts|all")
 	kFlag := fs.Int("k", 0, "cluster count (0 = auto)")
 	topFlag := fs.Int("top", 15, "max candidates per kind")
@@ -235,31 +399,16 @@ func cmdPatterns(args []string) {
 	repo := openDBOrExit(*dbFlag, true)
 	defer repo.Close()
 
-	model := *modelFlag
-	if model == "" {
-		model = indexCfg.EmbedModelOrDefault()
-	}
+	client, model, _ := ollamaFlags.resolve(indexCfg)
 	var chatSvc domain.ChatModel
 	if !*noLLMFlag {
-		ollamaURL := *ollamaFlag
-		if ollamaURL == "" {
-			ollamaURL = indexCfg.OllamaURLOrDefault()
-		}
-		chatModel := *chatFlag
-		if chatModel == "" {
-			chatModel = indexCfg.ChatModelOrDefault()
-		}
-		chatSvc = ollama.New(ollamaURL, model, chatModel)
+		chatSvc = client
 	}
 
-	var since time.Time
-	if *sinceFlag != "" {
-		d, err := parseSinceDuration(*sinceFlag)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "patterns: %v\n", err)
-			os.Exit(1)
-		}
-		since = time.Now().Add(-d)
+	since, err := app.SinceTime(*sinceFlag, time.Now())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "patterns: %v\n", err)
+		os.Exit(1)
 	}
 
 	svc := app.NewPatternService(repo, chatSvc)
@@ -419,18 +568,42 @@ func cmdIndex(args []string) {
 		stats.Sessions, stats.Orphaned, stats.Plans, stats.Skipped, stats.Messages, stats.Elapsed.Round(time.Millisecond))
 }
 
+// cmdSearch runs full-text (FTS) search by default. With --semantic it runs
+// embedding-based nearest-neighbor search instead. FTS Score is BM25 (lower
+// is better); semantic Score is cosine similarity (higher is better). FTS
+// search has no vendor/project/since filters — those apply to --semantic
+// only, since it queries the embeddings index rather than the FTS index.
 func cmdSearch(args []string) {
 	fs := flag.NewFlagSet("search", flag.ExitOnError)
 	dbFlag := fs.String("db", "", "path to DB file")
 	limitFlag := fs.Int("limit", 20, "max results")
 	jsonFlag := fs.Bool("json", false, "output JSON")
 	fuzzyFlag := fs.Bool("fuzzy", false, "fuzzy match terms (prefix + edit-distance-1)")
+	semanticFlag := fs.Bool("semantic", false, "semantic (embedding) search instead of full-text search")
+	vendorFlag := fs.String("vendor", "", "filter by vendor (--semantic only)")
+	projectFlag := fs.String("project", "", "filter by project path (--semantic only)")
+	sinceFlag := fs.String("since", "", "only messages since duration ago, e.g. 30d (--semantic only)")
+	ollamaFlags := addOllamaFlags(fs)
 	fs.Parse(args)
 
 	query := strings.Join(fs.Args(), " ")
 	if query == "" {
 		fmt.Fprintln(os.Stderr, "usage: chv search <query>")
 		os.Exit(1)
+	}
+
+	if *fuzzyFlag && *semanticFlag {
+		fmt.Fprintln(os.Stderr, "usage: --fuzzy cannot be combined with --semantic")
+		os.Exit(1)
+	}
+	if !*semanticFlag && (*vendorFlag != "" || *projectFlag != "" || *sinceFlag != "") {
+		fmt.Fprintln(os.Stderr, "usage: --vendor/--project/--since require --semantic — FTS search has no filters")
+		os.Exit(1)
+	}
+
+	if *semanticFlag {
+		cmdSearchSemantic(query, *limitFlag, *jsonFlag, *vendorFlag, *projectFlag, *sinceFlag, *dbFlag, ollamaFlags)
+		return
 	}
 
 	dbPath := *dbFlag
@@ -466,6 +639,42 @@ func cmdSearch(args []string) {
 	for _, h := range hits {
 		tag := vendorTag(h)
 		fmt.Printf("%s  %s%s\n  %s\n\n", h.SessionID, h.SessionTitle, tag, h.Snippet)
+	}
+}
+
+// cmdSearchSemantic runs the --semantic branch of cmdSearch.
+func cmdSearchSemantic(query string, limit int, jsonOut bool, vendorFlag, projectFlag, sinceFlag, dbFlag string, ollamaFlags ollamaFlags) {
+	indexCfg := loadIndexConfigOrExit()
+	repo := openDBOrExit(dbFlag, true)
+	defer repo.Close()
+
+	client, _, _ := ollamaFlags.resolve(indexCfg)
+
+	since, err := app.SinceTime(sinceFlag, time.Now())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "search: %v\n", err)
+		os.Exit(1)
+	}
+
+	svc := app.NewSemanticSearchService(client, repo, repo)
+	hits, err := svc.Search(context.Background(), query, app.SemanticSearchOpts{
+		Limit: limit, Vendor: domain.Vendor(vendorFlag), ProjectPath: projectFlag, Since: since,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "search: %v\n", err)
+		os.Exit(1)
+	}
+
+	if jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		enc.Encode(hits)
+		return
+	}
+
+	for _, h := range hits {
+		tag := vendorTag(h)
+		fmt.Printf("%s  %s%s  score=%.3f\n  %s\n\n", h.SessionID, h.SessionTitle, tag, h.Score, h.Snippet)
 	}
 }
 

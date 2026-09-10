@@ -64,22 +64,23 @@ func (s *AskService) Ask(ctx context.Context, question string, opts AskOptions) 
 		return AskResult{}, fmt.Errorf("init embeddings: %w", err)
 	}
 
-	vecs, err := s.embedder.Embed(ctx, []string{question})
+	filter := domain.EmbedFilter{Vendor: opts.Vendor, ProjectPath: opts.ProjectPath, Since: opts.Since}
+	raw, err := nearestUnits(ctx, s.embedder, s.repo, question, k, maxHitsPerSession, filter)
 	if err != nil {
-		return AskResult{}, fmt.Errorf("embed query: %w", err)
-	}
-	if len(vecs) == 0 {
-		return AskResult{}, fmt.Errorf("embed query: empty response")
+		return AskResult{}, err
 	}
 
-	filter := domain.EmbedFilter{Vendor: opts.Vendor, ProjectPath: opts.ProjectPath, Since: opts.Since}
-	raw, err := s.repo.Nearest(ctx, s.embedder.Model(), vecs[0], k*nearestPoolMultiplier, filter)
-	if err != nil {
-		return AskResult{}, fmt.Errorf("nearest: %w", err)
+	sessionIDs := make([]string, 0, len(raw))
+	seen := make(map[string]bool, len(raw))
+	for _, h := range raw {
+		if !seen[h.SessionID] {
+			seen[h.SessionID] = true
+			sessionIDs = append(sessionIDs, h.SessionID)
+		}
 	}
-	raw = dedupeBySession(raw, maxHitsPerSession)
-	if len(raw) > k {
-		raw = raw[:k]
+	sessions, err := s.search.SessionsByIDs(ctx, sessionIDs)
+	if err != nil {
+		sessions = nil
 	}
 
 	var hits []AskHit
@@ -92,8 +93,8 @@ func (s *AskService) Ask(ctx context.Context, question string, opts AskOptions) 
 		var title string
 		var vendor domain.Vendor
 		var started time.Time
-		if detail, err := s.search.SessionByID(ctx, h.SessionID); err == nil {
-			title, vendor, started = detail.Session.Title, detail.Session.Vendor, detail.Session.StartedAt
+		if sess, ok := sessions[h.SessionID]; ok {
+			title, vendor, started = sess.Title, sess.Vendor, sess.StartedAt
 		}
 		hits = append(hits, AskHit{
 			Num: i + 1, SessionID: h.SessionID, SessionTitle: title, Vendor: vendor,
@@ -122,6 +123,29 @@ func (s *AskService) Ask(ctx context.Context, question string, opts AskOptions) 
 	}
 	result.Answer = answer
 	return result, nil
+}
+
+// nearestUnits embeds query, retrieves the nearest k*nearestPoolMultiplier
+// vectors under filter f, dedupes them to at most perSession hits per
+// session, and truncates the result to k.
+func nearestUnits(ctx context.Context, e domain.Embedder, r domain.EmbeddingRepository, query string, k, perSession int, f domain.EmbedFilter) ([]domain.VectorHit, error) {
+	vecs, err := e.Embed(ctx, []string{query})
+	if err != nil {
+		return nil, fmt.Errorf("embed query: %w", err)
+	}
+	if len(vecs) == 0 {
+		return nil, fmt.Errorf("embed query: empty response")
+	}
+
+	raw, err := r.Nearest(ctx, e.Model(), vecs[0], k*nearestPoolMultiplier, f)
+	if err != nil {
+		return nil, fmt.Errorf("nearest: %w", err)
+	}
+	raw = dedupeBySession(raw, perSession)
+	if len(raw) > k {
+		raw = raw[:k]
+	}
+	return raw, nil
 }
 
 func dedupeBySession(hits []domain.VectorHit, maxPerSession int) []domain.VectorHit {

@@ -68,3 +68,27 @@
 - **Why:** keeps the "pure Go, no heavy deps" constraint; the corpus size here (thousands, not millions, of vectors) doesn't need a specialized clustering library, and the approximation is only used to rank a handful of candidate `k` values, not for final cluster quality guarantees.
 - **Rejected:** a Go ML/clustering package, computing exact (full pairwise) silhouette.
 - **Status:** current
+
+## [mcp] · Official `modelcontextprotocol/go-sdk` over stdio transport
+- **Decision:** `internal/adapter/mcp` builds its server on `github.com/modelcontextprotocol/go-sdk` (`sdk.NewServer`, `sdk.AddTool`, `sdk.StdioTransport`) rather than hand-rolling the MCP wire protocol.
+- **Why:** the SDK owns protocol-version compatibility, JSON-RPC framing, and tool-schema generation from Go input structs — hand-rolling that is a lot of surface area to keep correct for no benefit, and stdio matches how `chv` is invoked (a locally spawned subprocess per client, not a long-lived network service).
+- **Rejected:** a hand-written JSON-RPC/stdio loop; an HTTP/SSE MCP transport (adds a listener chv doesn't otherwise have and doesn't match the "local CLI tool" shape).
+- **Status:** current
+
+## [summarize] · No FK on `summaries` + `source_hash` for staleness detection
+- **Decision:** the `summaries` table (`session_id, model, source_hash, summary, created_at`, PK `(session_id, model)`) has no foreign key to `sessions`; `InitSummaries` instead sweeps rows whose `session_id` no longer exists in `sessions`, and a cache read only counts as a hit when the stored `source_hash` (SHA-256 of the condensed transcript) matches what the session condenses to right now.
+- **Why:** `ReplaceSession` deletes and reinserts a session's row (and its `messages`) on every re-index, even when content is unchanged — an `ON DELETE CASCADE` FK on `session_id` would wipe every cached summary on every routine reindex, defeating the point of caching. `source_hash` gives staleness detection without depending on rowid stability at all.
+- **Rejected:** an FK with cascade delete (wipes the cache on every re-index, per the embeddings-table experience with `message_rowid`); reattach/rowid tricks like the embeddings table's `(seq, sha256(text))` reattach (that scheme detects a single message's text changing, but not a session growing new messages or being restructured — `source_hash` over the whole condensed transcript catches both without needing per-message bookkeeping).
+- **Status:** current
+
+## [search] · `--semantic` as a flag on `chv search`, not a new subcommand
+- **Decision:** semantic search is `chv search --semantic` (plus `--vendor`/`--project`/`--since`, mutually exclusive with `--fuzzy`), implemented by `SemanticSearchService` and reusing the existing `domain.SearchHit` shape (with `Score` = cosine similarity) for output, rather than a separate `chv semantic-search` subcommand or a new result type.
+- **Why:** one query surface with one output shape is easier to remember and to consume (`--json` output is a `[]SearchHit` either way); the two modes already share "search over indexed history" framing, just with a different backing index (FTS5 vs. embeddings) and different score semantics (BM25, lower is better vs. cosine, higher is better) called out in docs rather than in the type.
+- **Rejected:** a new `chv semantic-search`/`chv ssearch` subcommand; a distinct output struct for semantic hits.
+- **Status:** current
+
+## [release] · Tag-driven GoReleaser + Homebrew cask in `primissus/homebrew-tap`
+- **Decision:** releases are cut by pushing an annotated `vX.Y.Z` tag; `.github/workflows/release.yml` runs GoReleaser (`.goreleaser.yml`) with `project_name: chv` to cross-compile Darwin/Linux `amd64`/`arm64` archives, publish the GitHub release, and generate/push a cask to `primissus/homebrew-tap` (same pattern as `zjump`). The `version` var in `cmd/chv/main.go` is set via `-ldflags -X main.version={{.Version}}`.
+- **Why:** matches the existing `zjump` release setup (one tap for all tools, `brew install primissus/tap/chv`), keeps binaries off the developer machine, and a generated cask can't drift from the artifacts.
+- **Rejected:** hand-writing/maintaining the cask (drifts from artifacts); `go install`-only distribution (no prebuilt binaries for users without a Go toolchain).
+- **Status:** current

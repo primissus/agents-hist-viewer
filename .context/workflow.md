@@ -20,4 +20,7 @@
 - [ ] New adapter/package: note it in AGENTS.md package table (and `.context/architecture.md` if structure changed)
 
 ## Deploy
-Local CLI, no CI/deploy pipeline. `make install` → `go install ./cmd/chv`; optional `make install-cron` (cron every 4h runs `chv index`), removed via `make uninstall-cron`. Users upgrade the DB schema by simply running `chv index` (`Repo.Init` runs migrations).
+Local CLI for day-to-day use: `make install` → `go install ./cmd/chv`; optional `make install-cron` (cron every 4h runs `chv index`), removed via `make uninstall-cron`. Users upgrade the DB schema by simply running `chv index` (`Repo.Init` runs migrations).
+
+## Release
+Tag-driven via GitHub Actions. Bump the `version` var in `cmd/chv/main.go`, commit, push `master`, then push an annotated `vX.Y.Z` tag. `.github/workflows/release.yml` runs GoReleaser (`.goreleaser.yml`) to cross-compile and publish the GitHub release, and to update the `primissus/homebrew-tap` cask (`brew install primissus/tap/chv`). The tap step requires the `HOMEBREW_TAP_GITHUB_TOKEN` repo secret. Do not edit the generated cask by hand.

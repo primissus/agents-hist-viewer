@@ -121,9 +121,11 @@ type fakeChatModel struct {
 	lastSystem, lastUser string
 	answer               string
 	err                  error
+	calls                int
 }
 
 func (f *fakeChatModel) Chat(_ context.Context, system, user string) (string, error) {
+	f.calls++
 	f.lastSystem, f.lastUser = system, user
 	if f.err != nil {
 		return "", f.err

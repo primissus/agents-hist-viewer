@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -84,8 +85,10 @@ type errMsg struct{ err error }
 
 // hitItem wraps SearchHit to implement list.DefaultItem.
 type hitItem struct {
-	hit       domain.SearchHit
-	listWidth int
+	hit        domain.SearchHit
+	listWidth  int
+	selected   bool
+	showMarker bool
 }
 
 func (h hitItem) FilterValue() string { return h.hit.SessionTitle }
@@ -101,6 +104,13 @@ func (h hitItem) Title() string {
 		t = h.hit.SessionID
 	}
 	t += hitTags(h.hit)
+	if h.showMarker {
+		if h.selected {
+			t = "[x] " + t
+		} else {
+			t = "[ ] " + t
+		}
+	}
 	return t
 }
 
@@ -191,6 +201,8 @@ type Model struct {
 	detailMatchCur     int
 	copiedMsg          string
 	helpFromState      viewState
+
+	selected map[string]bool
 }
 
 func NewApp(svc *appSvc.SearchService, histPath string) Model {
@@ -224,6 +236,7 @@ func NewApp(svc *appSvc.SearchService, histPath string) Model {
 		histPath:      histPath,
 		history:       loadHistory(histPath),
 		histCur:       -1,
+		selected:      map[string]bool{},
 	}
 }
 
@@ -275,6 +288,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.isHome = true
 		m.hits = msg.hits
+		m.selected = map[string]bool{}
 		m = m.applyFiltersAndSort()
 		m = m.syncResultsLayout()
 		return m, nil
@@ -285,6 +299,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.hits = msg.hits
 		m.lastQuery = msg.query
 		m.searched = true
+		m.selected = map[string]bool{}
 		m = m.applyFiltersAndSort()
 		m = m.syncResultsLayout()
 		return m, nil
@@ -390,9 +405,32 @@ func (m Model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch {
+	case key.Matches(msg, m.keys.Esc) && len(m.selected) > 0:
+		m.selected = map[string]bool{}
+		m = m.rebuildResultItems()
+		return m, nil
 	case key.Matches(msg, m.keys.Quit), key.Matches(msg, m.keys.Esc):
 		m.confirmQuit = true
 		return m, nil
+	case key.Matches(msg, m.keys.ToggleSelect):
+		var changed bool
+		m, changed = m.toggleSelectedAtCursor()
+		if !changed {
+			return m, nil
+		}
+		m = m.rebuildResultItems()
+		return m, nil
+	case key.Matches(msg, m.keys.SelectAll):
+		m = m.selectAllOrNone()
+		m = m.rebuildResultItems()
+		return m, nil
+	case key.Matches(msg, m.keys.CopyPaths):
+		lines, skipped := m.selectedPathLines()
+		m.copiedMsg = m.copiedPathsMsg(len(lines), skipped)
+		if len(lines) == 0 {
+			return m, nil
+		}
+		return m, doCopyToClipboard(strings.Join(lines, "\n"))
 	case msg.String() == "/":
 		cmd := m.input.Focus()
 		return m, cmd
@@ -820,10 +858,11 @@ func (m Model) applySortTo(filtered []domain.SearchHit) Model {
 }
 
 func (m Model) buildResultItems(hits []domain.SearchHit) []list.Item {
+	showMarker := len(m.selected) > 0
 	if m.groupMode == groupOff {
 		items := make([]list.Item, len(hits))
 		for i, h := range hits {
-			items[i] = hitItem{hit: h, listWidth: m.width}
+			items[i] = hitItem{hit: h, listWidth: m.width, selected: m.selected[h.SessionID], showMarker: showMarker}
 		}
 		return items
 	}
@@ -843,9 +882,114 @@ func (m Model) buildResultItems(hits []domain.SearchHit) []list.Item {
 			items = append(items, groupHeaderItem{title: group})
 			lastGroup = group
 		}
-		items = append(items, hitItem{hit: h, listWidth: m.width})
+		items = append(items, hitItem{hit: h, listWidth: m.width, selected: m.selected[h.SessionID], showMarker: showMarker})
 	}
 	return items
+}
+
+// rebuildResultItems rebuilds m.list's items from m.filteredHits (picking up
+// current selection markers) while preserving the cursor position.
+func (m Model) rebuildResultItems() Model {
+	idx := m.list.Index()
+	m.list.SetItems(m.buildResultItems(m.filteredHits))
+	m.list.Select(idx)
+	return m
+}
+
+// toggleSelectedAtCursor toggles selection of the item under the cursor. It
+// is a no-op (changed=false) when nothing is selected or the cursor is on a
+// group header.
+func (m Model) toggleSelectedAtCursor() (Model, bool) {
+	sel := m.list.SelectedItem()
+	if sel == nil {
+		return m, false
+	}
+	item, ok := sel.(hitItem)
+	if !ok {
+		return m, false
+	}
+	if m.selected == nil {
+		m.selected = map[string]bool{}
+	}
+	id := item.hit.SessionID
+	if m.selected[id] {
+		delete(m.selected, id)
+	} else {
+		m.selected[id] = true
+	}
+	return m, true
+}
+
+// selectAllOrNone selects every currently-listed hit, or clears the
+// selection if all of them are already selected.
+func (m Model) selectAllOrNone() Model {
+	allSelected := len(m.filteredHits) > 0
+	for _, h := range m.filteredHits {
+		if !m.selected[h.SessionID] {
+			allSelected = false
+			break
+		}
+	}
+	if allSelected {
+		m.selected = map[string]bool{}
+		return m
+	}
+	next := make(map[string]bool, len(m.filteredHits))
+	for _, h := range m.filteredHits {
+		next[h.SessionID] = true
+	}
+	m.selected = next
+	return m
+}
+
+// selectionTargets returns the hits the current selection applies to, in
+// display order, falling back to the cursor item when nothing is selected.
+func (m Model) selectionTargets() []domain.SearchHit {
+	if len(m.selected) > 0 {
+		var out []domain.SearchHit
+		for _, h := range m.filteredHits {
+			if m.selected[h.SessionID] {
+				out = append(out, h)
+			}
+		}
+		return out
+	}
+	if sel := m.list.SelectedItem(); sel != nil {
+		if item, ok := sel.(hitItem); ok {
+			return []domain.SearchHit{item.hit}
+		}
+	}
+	return nil
+}
+
+// selectedPathLines formats the current selection (or the cursor item as a
+// fallback) as clipboard lines of "FilePath\tProjectPath", skipping hits
+// with no FilePath.
+func (m Model) selectedPathLines() (lines []string, skipped int) {
+	for _, h := range m.selectionTargets() {
+		if h.FilePath == "" {
+			skipped++
+			continue
+		}
+		lines = append(lines, h.FilePath+"\t"+h.ProjectPath)
+	}
+	return lines, skipped
+}
+
+// copiedPathsMsg formats the toast message for a copy-paths action.
+func (m Model) copiedPathsMsg(n, skipped int) string {
+	if n == 0 {
+		return "No file paths to copy"
+	}
+	word := "path"
+	if n != 1 {
+		word = "paths"
+	}
+	msg := fmt.Sprintf("Copied %d %s", n, word)
+	if skipped > 0 {
+		msg += fmt.Sprintf(" (%d skipped: no file)", skipped)
+	}
+	return msg
 }
 
 func (m Model) groupSortKey(h domain.SearchHit) string {

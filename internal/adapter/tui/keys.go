@@ -26,6 +26,9 @@ type keyMap struct {
 	TimeFormat     key.Binding
 	MsgFilter      key.Binding
 	CopyFilePath   key.Binding
+	ToggleSelect   key.Binding
+	SelectAll      key.Binding
+	CopyPaths      key.Binding
 }
 
 var defaultKeyMap = keyMap{
@@ -52,4 +55,7 @@ var defaultKeyMap = keyMap{
 	TimeFormat:     key.NewBinding(key.WithKeys("T"), key.WithHelp("T", "local/UTC/date/off")),
 	MsgFilter:      key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "cycle msg type")),
 	CopyFilePath:   key.NewBinding(key.WithKeys("shift+f", "F"), key.WithHelp("shift+F", "copy file path")),
+	ToggleSelect:   key.NewBinding(key.WithKeys(" "), key.WithHelp("space", "toggle select")),
+	SelectAll:      key.NewBinding(key.WithKeys("ctrl+a"), key.WithHelp("ctrl+a", "select all/none")),
+	CopyPaths:      key.NewBinding(key.WithKeys("shift+y", "Y"), key.WithHelp("shift+Y", "copy paths")),
 }

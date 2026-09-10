@@ -82,9 +82,9 @@ func renderResultsFooter(m Model) string {
 		return current.Footer.Render("Loading…")
 	default:
 		lim := limitsForWidth(m.width)
-		hint := "/ search  S copy-id  P copy-path  shift+F copy-file  f filters  t type  s sort  g group  ? help"
+		hint := "/ search  S copy-id  P copy-path  shift+F copy-file  space select  Y copy-paths  f filters  t type  s sort  g group  ? help"
 		if m.searched {
-			hint = "/ search  c clear  S copy-id  P copy-path  shift+F copy-file  f filters  t type  s sort  g group  ? help"
+			hint = "/ search  c clear  S copy-id  P copy-path  shift+F copy-file  space select  Y copy-paths  f filters  t type  s sort  g group  ? help"
 		}
 		if m.isHome || m.searched {
 			total := len(m.hits)
@@ -99,6 +99,9 @@ func renderResultsFooter(m Model) string {
 				hint += fmt.Sprintf("  (%d recent)", total)
 			} else {
 				hint += fmt.Sprintf("  (%d results)", total)
+			}
+			if len(m.selected) > 0 {
+				hint += fmt.Sprintf("  %d selected", len(m.selected))
 			}
 			if m.sortMode != sortRelevance {
 				hint += "  sort:" + m.sortMode.label()

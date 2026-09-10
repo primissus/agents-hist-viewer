@@ -1,0 +1,63 @@
+# GoReleaser configuration for chv.
+# See https://goreleaser.com for full reference.
+version: 2
+
+project_name: chv
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: chv
+    main: ./cmd/chv
+    binary: chv
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - formats: tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  draft: false
+  prerelease: auto
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - Merge pull request
+      - Merge branch
+
+homebrew_casks:
+  - name: chv
+    homepage: https://github.com/primissus/agents-hist-viewer
+    description: Search Claude Code, Claude Desktop, Cursor, OpenCode & Codex history from the terminal.
+    binaries:
+      - chv
+    url:
+      verified: github.com/primissus/agents-hist-viewer
+    repository:
+      owner: primissus
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    commit_msg_template: "Brew cask: update chv to {{ .Tag }}"
+    caveats: |
+      Run once to build the search index:
+        chv index

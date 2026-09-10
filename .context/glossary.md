@@ -20,6 +20,9 @@
 - **Candidate** (skill/script) → a ranked, chat-model-labeled cluster or command n-gram surfaced by `chv patterns`, optionally written as `SKILL-CANDIDATE-<slug>.md` / `SCRIPT-CANDIDATE-<slug>.md`
 - **RAG** → retrieval-augmented generation: `chv ask` retrieves relevant embed units, then asks a chat model to answer citing them
 - **Ollama** → the local model runtime chv talks to for embeddings (`mxbai-embed-large` default) and chat (`qwen3.6:35b-a3b` default), via `internal/adapter/ollama`
+- **MCP** → Model Context Protocol: the stdio protocol `chv mcp` speaks (`internal/adapter/mcp`, `github.com/modelcontextprotocol/go-sdk`) to expose search/summarize as tools to MCP clients like Claude Code
+- **Condensed transcript** → the deterministic, chat-model-free digest of a session's messages produced by `Condense`/`app.Condense`: drops thinking/images/sidechains, truncates tool/assistant text, applies a 60/40 start/end budget split under `MaxChars` while always keeping user turns; it's both the LLM input for `chv summarize` and what `--no-llm`/`condensed_only` prints directly
+- **source_hash** → SHA-256 of a session's condensed transcript, stored per cached row in `summaries`; a cache read only counts as a hit when it still matches, so edited/regrown session content invalidates the cache without needing a foreign key or rowid tricks
 
 ## Main entities
 - **Session** → `id, title, project_path, git_branch, started_at, ended_at, message_count, file_path, has_transcript, record_kind, vendor`

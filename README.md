@@ -2,6 +2,12 @@
 
 Globally search across Claude Code, Claude Desktop, Cursor, OpenCode, and Codex session transcripts, typed prompts, and plan documents. Find what you said, which session it was in, and browse the full conversation.
 
+## Install
+
+```sh
+brew install primissus/tap/chv
+```
+
 ## Build
 
 ```sh
@@ -12,6 +18,10 @@ make install   # installs to $GOPATH/bin
 ```
 
 Requires Go 1.26+. No CGO — pure Go SQLite (`modernc.org/sqlite`).
+
+## Releases
+
+Pushing a `vX.Y.Z` tag triggers GitHub Actions (GoReleaser): it cross-compiles Darwin/Linux `amd64`/`arm64` archives, publishes the GitHub release, and updates the `primissus/homebrew-tap` cask. The Homebrew tap push needs a `HOMEBREW_TAP_GITHUB_TOKEN` repo secret.
 
 ## First run
 
@@ -24,7 +34,7 @@ chv                # launch interactive TUI
 
 ## Local RAG & pattern mining (optional)
 
-`chv embed`, `chv ask`, and `chv patterns` add semantic search, question-answering, and usage-pattern mining over your own indexed history — entirely local, via [Ollama](https://ollama.com):
+`chv embed`, `chv search --semantic`, `chv ask`, `chv patterns`, and `chv summarize` add semantic search, question-answering, usage-pattern mining, and session recaps over your own indexed history — entirely local, via [Ollama](https://ollama.com). `chv mcp` exposes the same search/summarize surface to MCP clients (e.g. Claude Code) over stdio.
 
 ```sh
 ollama pull mxbai-embed-large   # embedding model (1024d, default)
@@ -172,13 +182,19 @@ a1b2c3d4-…  Fix login redirect [prompt-only]
 ```
 
 ```
---db PATH     override DB file location
---limit N     max results (default 20)
---json        output results as JSON (array of SearchHit objects)
---fuzzy       fuzzy-match all bare terms
+--db PATH       override DB file location
+--limit N       max results (default 20)
+--json          output results as JSON (array of SearchHit objects)
+--fuzzy         fuzzy-match all bare terms (FTS mode only)
+--semantic      semantic (embedding) search instead of full-text search
+--vendor NAME   filter by vendor (--semantic only)
+--project PATH  filter by project path (--semantic only)
+--since DUR     only messages since duration ago, e.g. 30d (--semantic only)
 ```
 
-**Query syntax** (compiled to FTS5):
+`--fuzzy` cannot be combined with `--semantic` (usage error), and `--vendor`/`--project`/`--since` require `--semantic` — plain FTS search has no filters and passing them without `--semantic` is also a usage error.
+
+**Query syntax** (compiled to FTS5, FTS mode only):
 
 | Syntax | Meaning |
 |--------|---------|
@@ -194,6 +210,15 @@ a1b2c3d4-…  Fix login redirect [prompt-only]
 Fuzzy = prefix + edit-distance-1 variants, not full typo tolerance. AND still requires terms in the **same indexed message row** (not across messages in a session).
 
 Sessions without a transcript on disk are shown with a `[prompt-only]` tag. Plan files appear with `[plan]`. Results include their source label: `[Claude Code]`, `[Claude Desktop]`, `[Cursor]`, `[OpenCode]`, or `[Codex]`.
+
+**`--semantic`** runs `chv ask`'s retrieval step without the chat-model answer: it embeds the query and returns the nearest message per session (deduped, ranked by cosine similarity). It shares the embedding-model/Ollama flags (`--model`, `--ollama`) with `chv embed`/`ask` and reuses the same `SearchHit` JSON shape as FTS search, with `Score` populated.
+
+**Score semantics differ by mode** — this matters when reading `--json` output or comparing runs:
+
+| Mode | Score | Direction |
+|------|-------|-----------|
+| FTS (default) | BM25 | **lower is better** |
+| `--semantic` | cosine similarity | **higher is better** |
 
 ### `chv embed`
 
@@ -252,6 +277,72 @@ Mines the embedded corpus for repeated behavior and drafts candidates:
 --no-llm        rank and report clusters without chat-model labeling
 ```
 
+### `chv summarize <session-id | path.jsonl>`
+
+Condenses a session's transcript deterministically (no chat model — see "condensed transcript" below), then, unless `--no-llm`, asks the chat model for a five-section recap (`Goal`, `What was done`, `Key decisions`, `Files / areas touched`, `Outcome & open items`). The recap prints to stdout; a one-line status (model + cached/fresh + date) goes to stderr. The positional argument is either a session ID already in the index, or a path ending in `.jsonl` loaded directly (no indexing required, mirroring `chv view`).
+
+```
+--db PATH        override DB file location
+--model NAME     embedding model (unused by summarize itself; shared flag)
+--chat NAME      chat model (default: index.json chat_model, else qwen3.6:35b-a3b)
+--ollama URL     Ollama base URL
+--refresh        bypass the cached summary and regenerate
+--no-llm         condense only — print the condensed transcript, skip the chat model
+--json           output JSON (SummarizeResult)
+--max-chars N    condensed-text budget in runes (0 = default, 24000)
+--format FORMAT  transcript format for a .jsonl arg: auto, claude, cursor, or codex
+```
+
+**Caching** — summaries are cached in a `summaries` SQLite table keyed by `(session_id, chat_model)`: summarizing the same session with the same chat model again returns the cached recap instead of calling Ollama. The cache auto-invalidates when the session's content changes: each cached row stores a `source_hash` (SHA-256 of the condensed transcript), and a cache hit only counts if the hash still matches what the session condenses to today (e.g. after a re-index picked up edited/new messages). `--refresh` bypasses the cache read and always regenerates, overwriting the cached row. The cache only applies to a session ID already in the index — summarizing a raw `.jsonl` path also caches, but only when a DB already exists on disk (summarizing a file never creates a DB as a side effect).
+
+`--no-llm` skips both the chat model call and the cache: it prints the condensed transcript (the same deterministic digest that would otherwise be sent to the chat model) and nothing else on stdout.
+
+### `chv mcp`
+
+Runs chv as an MCP ([Model Context Protocol](https://modelcontextprotocol.io)) stdio server, exposing search and summarize over an MCP transport for clients like Claude Code.
+
+```
+--db PATH     override DB file location
+--model NAME  embedding model (for semantic_search)
+--chat NAME   chat model (for summarize_session)
+--ollama URL  Ollama base URL
+--no-llm      don't construct a chat-capable summarizer; summarize_session only works with condensed_only:true
+--debug       log server activity to stderr
+```
+
+Tools exposed:
+
+| Tool | Purpose |
+|------|---------|
+| `search_history` | Full-text (FTS5) search over indexed sessions. |
+| `semantic_search` | Embedding-based nearest-neighbor search (requires `chv embed` to have run). |
+| `list_sessions` | Browse recent sessions, optionally filtered by vendor/project/kind. |
+| `get_session` | Fetch a session's messages, paginated and filterable by kind. |
+| `summarize_session` | Condense a session's transcript, optionally with a cached LLM-generated recap. |
+
+`semantic_search` and `summarize_session` (unless called with `condensed_only: true`) need a reachable Ollama server — same requirement as `chv search --semantic`/`chv ask`/`chv summarize`.
+
+**Register with Claude Code:**
+
+```sh
+claude mcp add chv -- chv mcp
+```
+
+Or via a project `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "chv": {
+      "command": "chv",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+**stdout is the protocol channel** — in `chv mcp` mode, chv writes nothing else to stdout; all logs and diagnostics go to stderr (enable with `--debug`). A stray write to stdout anywhere in the tool-call path would corrupt the protocol stream and break the client.
+
 ### `chv` (no subcommand)
 
 Launches the interactive TUI. Exits with a helpful message if the DB hasn't been created yet.
@@ -265,6 +356,10 @@ Set `CHV_NO_COLOR_QUERY=1` to skip terminal palette detection and use ANSI fallb
 `ctrl+c` quits immediately. `q` and `esc` ask for confirmation (`Quit chv? [y/N]`).
 
 Press `?` anywhere for an in-app shortcut reference.
+
+## Claude Code skill: chv-summarize
+
+`skills/chv-summarize/` is a Claude Code skill that has the calling agent write a session recap itself, using `chv summarize --no-llm` only for the condensed transcript (no local chat model involved). See `skills/chv-summarize/SKILL.md` for the trigger phrases and install instructions (`ln -s`).
 
 ## TUI keybindings
 
@@ -287,9 +382,15 @@ Press `?` anywhere for an in-app shortcut reference.
 | `S` | Copy session ID to clipboard |
 | `P` | Copy project path to clipboard |
 | `shift+F` / `F` | Copy transcript/plan file path to clipboard |
+| `space` | Toggle selection of the item under the cursor |
+| `ctrl+a` | Select all currently-listed hits, or deselect all if all are selected |
+| `shift+Y` / `Y` | Copy paths for the selection (or just the cursor item if nothing is selected) |
 | `?` | Show keyboard shortcuts |
-| `q` / `esc` | Quit (with confirmation) |
+| `q` | Quit (with confirmation) |
+| `esc` | Clear the selection if non-empty; otherwise quit (with confirmation) |
 | `ctrl+c` | Quit immediately |
+
+`shift+Y` copies one line per session as `FilePath<TAB>ProjectPath`, newline-joined; sessions with no file path are skipped.
 
 ### Filter view
 

@@ -15,7 +15,7 @@
 
 ## FORBIDDEN patterns
 - No CGO / cgo-enabled SQLite drivers (use `modernc.org/sqlite`)
-- No heavy deps without reason (bubbletea ecosystem + modernc are the allowed set)
+- No heavy deps without reason (bubbletea ecosystem + modernc are the allowed set; `github.com/modelcontextprotocol/go-sdk` is also allowed, for `internal/adapter/mcp`'s MCP stdio server)
 - No business logic in `cmd/` — CLI flags live only in `cmd/chv/main.go`
 - No changes to XDG paths without updating `internal/config/config.go` + README
 - No user-doc duplication — README is the single user doc; AGENTS.md links it

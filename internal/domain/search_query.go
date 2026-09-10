@@ -46,7 +46,10 @@ func CompileSearchQuery(raw string, opts SearchOpts) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	out := compileSearchNode(ast, opts)
+	out, err := compileSearchNode(ast, opts)
+	if err != nil {
+		return "", err
+	}
 	if out == "" {
 		return "", fmt.Errorf("empty query")
 	}
@@ -320,31 +323,64 @@ func (p *sqParser) parsePrimary() (*sqNode, error) {
 	}
 }
 
-func compileSearchNode(n *sqNode, opts SearchOpts) string {
+func compileSearchNode(n *sqNode, opts SearchOpts) (string, error) {
 	switch n.kind {
 	case sqNTerm:
-		return compileSearchTerm(n.value, n.quoted, n.fuzzy || opts.Fuzzy)
+		return compileSearchTerm(n.value, n.quoted, n.fuzzy || opts.Fuzzy), nil
 	case sqNAnd:
-		parts := make([]string, len(n.kids))
-		for i, c := range n.kids {
-			parts[i] = wrapGroup(compileSearchNode(c, opts))
-		}
-		return strings.Join(parts, " ")
+		return compileSearchAnd(n, opts)
 	case sqNOr:
 		parts := make([]string, len(n.kids))
 		for i, c := range n.kids {
-			parts[i] = wrapGroup(compileSearchNode(c, opts))
+			if c.kind == sqNNot {
+				return "", fmt.Errorf("NOT cannot be a top-level OR operand (use a term before -excluded)")
+			}
+			s, err := compileSearchNode(c, opts)
+			if err != nil {
+				return "", err
+			}
+			parts[i] = wrapGroup(s)
 		}
-		return "(" + strings.Join(parts, " OR ") + ")"
+		return "(" + strings.Join(parts, " OR ") + ")", nil
 	case sqNNot:
-		return "NOT " + wrapGroup(compileSearchNode(n.kids[0], opts))
+		return "", fmt.Errorf("query must include a term to search for, not only exclusions")
 	default:
-		return ""
+		return "", nil
 	}
 }
 
+// compileSearchAnd renders AND nodes using explicit operators. FTS5's NOT is a
+// binary operator with a left operand, so exclusions are appended as
+// `positive NOT excluded` rather than as a unary-prefixed group.
+func compileSearchAnd(n *sqNode, opts SearchOpts) (string, error) {
+	var positives, negatives []string
+	for _, c := range n.kids {
+		if c.kind == sqNNot {
+			s, err := compileSearchNode(c.kids[0], opts)
+			if err != nil {
+				return "", err
+			}
+			negatives = append(negatives, wrapGroup(s))
+			continue
+		}
+		s, err := compileSearchNode(c, opts)
+		if err != nil {
+			return "", err
+		}
+		positives = append(positives, wrapGroup(s))
+	}
+	if len(positives) == 0 {
+		return "", fmt.Errorf("query must include a term to search for, not only exclusions")
+	}
+	out := strings.Join(positives, " AND ")
+	for _, neg := range negatives {
+		out += " NOT " + neg
+	}
+	return out, nil
+}
+
 func wrapGroup(s string) string {
-	if strings.Contains(s, " OR ") || strings.HasPrefix(s, "NOT ") {
+	if strings.Contains(s, " AND ") || strings.Contains(s, " OR ") || strings.Contains(s, " NOT ") {
 		return "(" + s + ")"
 	}
 	return s
@@ -370,14 +406,20 @@ func quoteFTSTerm(term string) string {
 	}
 	upper := strings.ToUpper(term)
 	if upper == "AND" || upper == "OR" || upper == "NOT" || upper == "NEAR" {
-		return `"` + strings.ReplaceAll(term, `"`, `""`) + `"`
+		return quoteFTSTermRaw(term)
 	}
+	// FTS5 treats characters such as '-', '.', ':', '/', '#' and '^' as query
+	// syntax. Quote anything that is not a plain bareword so they match literally.
 	if strings.IndexFunc(term, func(r rune) bool {
-		return unicode.IsSpace(r) || r == '"' || r == '(' || r == ')' || r == '*' 
+		return !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_')
 	}) >= 0 {
-		return `"` + strings.ReplaceAll(term, `"`, `""`) + `"`
+		return quoteFTSTermRaw(term)
 	}
 	return term
+}
+
+func quoteFTSTermRaw(term string) string {
+	return `"` + strings.ReplaceAll(term, `"`, `""`) + `"`
 }
 
 func quoteOrPrefix(v string) string {
