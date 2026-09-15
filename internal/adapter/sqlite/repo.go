@@ -189,8 +189,8 @@ func preservedEmbeddings(ctx context.Context, tx *sql.Tx, sessionID string) (map
 	return out, rows.Err()
 }
 
-func (r *Repo) Search(ctx context.Context, query string, limit int) ([]domain.SearchHit, error) {
-	const q = `
+func (r *Repo) Search(ctx context.Context, query string, limit int, f domain.SearchFilter) ([]domain.SearchHit, error) {
+	q := `
 SELECT m.uuid, m.session_id, m.role, m.kind, m.timestamp,
        s.title, s.project_path, s.file_path, s.has_transcript, s.started_at, s.record_kind, s.vendor,
        snippet(messages_fts, 0, '[', ']', ' … ', 12) AS snip,
@@ -198,7 +198,13 @@ SELECT m.uuid, m.session_id, m.role, m.kind, m.timestamp,
 FROM messages_fts
 JOIN messages m ON m.rowid = messages_fts.rowid
 JOIN sessions s ON s.id = m.session_id
-WHERE messages_fts MATCH ?
+WHERE messages_fts MATCH ?`
+	args := []any{query}
+	if !f.Since.IsZero() {
+		q += ` AND m.timestamp >= ?`
+		args = append(args, f.Since.UTC().Format(time.RFC3339Nano))
+	}
+	q += `
 ORDER BY score
 LIMIT ?`
 
@@ -207,7 +213,8 @@ LIMIT ?`
 	if fetchLimit < 500 {
 		fetchLimit = 500
 	}
-	rows, err := r.db.QueryContext(ctx, q, query, fetchLimit)
+	args = append(args, fetchLimit)
+	rows, err := r.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -265,6 +272,10 @@ WHERE 1=1`
 	if q.Vendor != "" {
 		query += ` AND vendor = ?`
 		args = append(args, vendor(q.Vendor))
+	}
+	if !q.Since.IsZero() {
+		query += ` AND ended_at >= ?`
+		args = append(args, q.Since.UTC().Format(time.RFC3339Nano))
 	}
 	query += ` ORDER BY ended_at DESC LIMIT ?`
 	args = append(args, limit)

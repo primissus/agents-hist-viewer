@@ -570,9 +570,9 @@ func cmdIndex(args []string) {
 
 // cmdSearch runs full-text (FTS) search by default. With --semantic it runs
 // embedding-based nearest-neighbor search instead. FTS Score is BM25 (lower
-// is better); semantic Score is cosine similarity (higher is better). FTS
-// search has no vendor/project/since filters — those apply to --semantic
-// only, since it queries the embeddings index rather than the FTS index.
+// is better); semantic Score is cosine similarity (higher is better).
+// --since applies to both modes; --vendor/--project apply to --semantic only,
+// since it queries the embeddings index rather than the FTS index.
 func cmdSearch(args []string) {
 	fs := flag.NewFlagSet("search", flag.ExitOnError)
 	dbFlag := fs.String("db", "", "path to DB file")
@@ -582,7 +582,7 @@ func cmdSearch(args []string) {
 	semanticFlag := fs.Bool("semantic", false, "semantic (embedding) search instead of full-text search")
 	vendorFlag := fs.String("vendor", "", "filter by vendor (--semantic only)")
 	projectFlag := fs.String("project", "", "filter by project path (--semantic only)")
-	sinceFlag := fs.String("since", "", "only messages since duration ago, e.g. 30d (--semantic only)")
+	sinceFlag := fs.String("since", "", "only messages since duration ago, e.g. 30d")
 	ollamaFlags := addOllamaFlags(fs)
 	fs.Parse(args)
 
@@ -596,8 +596,8 @@ func cmdSearch(args []string) {
 		fmt.Fprintln(os.Stderr, "usage: --fuzzy cannot be combined with --semantic")
 		os.Exit(1)
 	}
-	if !*semanticFlag && (*vendorFlag != "" || *projectFlag != "" || *sinceFlag != "") {
-		fmt.Fprintln(os.Stderr, "usage: --vendor/--project/--since require --semantic — FTS search has no filters")
+	if !*semanticFlag && (*vendorFlag != "" || *projectFlag != "") {
+		fmt.Fprintln(os.Stderr, "usage: --vendor/--project require --semantic — FTS search has no such filters")
 		os.Exit(1)
 	}
 
@@ -622,8 +622,14 @@ func cmdSearch(args []string) {
 	}
 	defer repo.Close()
 
+	since, err := app.SinceTime(*sinceFlag, time.Now())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "since: %v\n", err)
+		os.Exit(1)
+	}
+
 	svc := app.NewSearchService(repo)
-	hits, err := svc.Search(context.Background(), query, *limitFlag, domain.SearchOpts{Fuzzy: *fuzzyFlag})
+	hits, err := svc.Search(context.Background(), query, *limitFlag, domain.SearchOpts{Fuzzy: *fuzzyFlag}, domain.SearchFilter{Since: since})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "search: %v\n", err)
 		os.Exit(1)

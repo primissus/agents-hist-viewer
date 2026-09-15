@@ -284,6 +284,32 @@ func TestSearchHistoryLimitClamping(t *testing.T) {
 	}
 }
 
+func TestSearchHistorySinceFilter(t *testing.T) {
+	r := seedRepo(t)
+	h := newHandlers(r)
+
+	_, out, err := h.searchHistory(context.Background(), nil, searchHistoryInput{Query: "widget", Since: "1h"})
+	if err != nil {
+		t.Fatalf("searchHistory: %v", err)
+	}
+	if len(out.Hits) != 0 {
+		t.Fatalf("expected no hits for since=1h against 2026 fixture, got %+v", out.Hits)
+	}
+
+	_, out, err = h.searchHistory(context.Background(), nil, searchHistoryInput{Query: "widget", Since: ""})
+	if err != nil {
+		t.Fatalf("searchHistory: %v", err)
+	}
+	if len(out.Hits) == 0 {
+		t.Fatal("expected hits with no since filter")
+	}
+
+	_, _, err = h.searchHistory(context.Background(), nil, searchHistoryInput{Query: "widget", Since: "notaduration"})
+	if err == nil || !strings.Contains(err.Error(), "since:") {
+		t.Fatalf("expected 'since:' error for invalid duration, got: %v", err)
+	}
+}
+
 // --- list_sessions --------------------------------------------------------
 
 func TestListSessionsVendorFilter(t *testing.T) {
@@ -309,6 +335,32 @@ func TestListSessionsLimitClamping(t *testing.T) {
 	}
 	if len(out.Sessions) > 200 {
 		t.Fatalf("expected sessions clamped to <= 200, got %d", len(out.Sessions))
+	}
+}
+
+func TestListSessionsSinceFilter(t *testing.T) {
+	r := seedRepo(t)
+	h := newHandlers(r)
+
+	_, out, err := h.listSessions(context.Background(), nil, listSessionsInput{Since: "1h", Limit: 50})
+	if err != nil {
+		t.Fatalf("listSessions: %v", err)
+	}
+	if len(out.Sessions) != 0 {
+		t.Fatalf("expected no sessions for since=1h against 2026 fixture, got %+v", out.Sessions)
+	}
+
+	_, out, err = h.listSessions(context.Background(), nil, listSessionsInput{Since: "", Limit: 50})
+	if err != nil {
+		t.Fatalf("listSessions: %v", err)
+	}
+	if len(out.Sessions) == 0 {
+		t.Fatal("expected sessions with no since filter")
+	}
+
+	_, _, err = h.listSessions(context.Background(), nil, listSessionsInput{Since: "notaduration"})
+	if err == nil || !strings.Contains(err.Error(), "since:") {
+		t.Fatalf("expected 'since:' error for invalid duration, got: %v", err)
 	}
 }
 

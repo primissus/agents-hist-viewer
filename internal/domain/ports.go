@@ -32,7 +32,7 @@ type SearchRepository interface {
 	ReplaceSession(ctx context.Context, s Session, msgs []Message) error
 	GetFileHash(ctx context.Context, path string) (hash string, ok bool, err error)
 	SetFileHash(ctx context.Context, path, sessionID, hash string) error
-	Search(ctx context.Context, query string, limit int) ([]SearchHit, error)
+	Search(ctx context.Context, query string, limit int, f SearchFilter) ([]SearchHit, error)
 	RecentSessions(ctx context.Context, q RecentQuery) ([]SearchHit, error)
 	SessionByID(ctx context.Context, id string) (SessionDetail, error)
 	SessionsByIDs(ctx context.Context, ids []string) (map[string]Session, error)
@@ -45,6 +45,12 @@ type RecentQuery struct {
 	RecordKind  RecordKind // empty = all
 	ProjectPath string     // empty = all
 	Vendor      Vendor     // empty = all
+	Since       time.Time  // zero = no filter
+}
+
+// SearchFilter narrows FTS search results.
+type SearchFilter struct {
+	Since time.Time // zero = no filter
 }
 
 // Embedder turns text into vectors using a local embedding model.

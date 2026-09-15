@@ -140,6 +140,7 @@ type searchHistoryInput struct {
 	Query string `json:"query"`
 	Limit int    `json:"limit,omitempty"`
 	Fuzzy bool   `json:"fuzzy,omitempty"`
+	Since string `json:"since,omitempty"`
 }
 
 type searchHistoryOutput struct {
@@ -150,8 +151,12 @@ func (h *handlers) searchHistory(ctx context.Context, _ *sdk.CallToolRequest, in
 	if h.d.Search == nil {
 		return nil, searchHistoryOutput{}, errors.New("search unavailable (no search service configured)")
 	}
+	since, err := app.SinceTime(in.Since, time.Now())
+	if err != nil {
+		return nil, searchHistoryOutput{}, fmt.Errorf("since: %w", err)
+	}
 	limit := clamp(in.Limit, 20, 100)
-	hits, err := h.d.Search.Search(ctx, in.Query, limit, domain.SearchOpts{Fuzzy: in.Fuzzy})
+	hits, err := h.d.Search.Search(ctx, in.Query, limit, domain.SearchOpts{Fuzzy: in.Fuzzy}, domain.SearchFilter{Since: since})
 	if err != nil {
 		return nil, searchHistoryOutput{}, fmt.Errorf("search: %w", err)
 	}
@@ -217,6 +222,7 @@ type listSessionsInput struct {
 	Vendor  string `json:"vendor,omitempty"`
 	Project string `json:"project,omitempty"`
 	Kind    string `json:"kind,omitempty"`
+	Since   string `json:"since,omitempty"`
 }
 
 type listSessionsOutput struct {
@@ -227,12 +233,17 @@ func (h *handlers) listSessions(ctx context.Context, _ *sdk.CallToolRequest, in 
 	if h.d.Search == nil {
 		return nil, listSessionsOutput{}, errors.New("list_sessions unavailable (no search service configured)")
 	}
+	since, err := app.SinceTime(in.Since, time.Now())
+	if err != nil {
+		return nil, listSessionsOutput{}, fmt.Errorf("since: %w", err)
+	}
 	limit := clamp(in.Limit, 20, 200)
 	hits, err := h.d.Search.RecentSessions(ctx, domain.RecentQuery{
 		Limit:       limit,
 		RecordKind:  domain.RecordKind(in.Kind),
 		ProjectPath: in.Project,
 		Vendor:      domain.Vendor(in.Vendor),
+		Since:       since,
 	})
 	if err != nil {
 		return nil, listSessionsOutput{}, fmt.Errorf("list_sessions: %w", err)

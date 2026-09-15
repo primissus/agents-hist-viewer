@@ -98,7 +98,7 @@ func TestNoDuplicateHitsForPromptInBothSources(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hits, err := repo.Search(ctx, "unique transcript", 10)
+	hits, err := repo.Search(ctx, "unique transcript", 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestOrphanedSessionSearchable(t *testing.T) {
 		t.Errorf("expected 1 orphaned, got %d", stats.Orphaned)
 	}
 
-	hits, err := repo.Search(ctx, "orphaned searchable", 10)
+	hits, err := repo.Search(ctx, "orphaned searchable", 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestPlansSearchable(t *testing.T) {
 		t.Errorf("expected 1 plan, got %d", stats.Plans)
 	}
 
-	hits, err := repo.Search(ctx, "unique plan phrase", 10)
+	hits, err := repo.Search(ctx, "unique plan phrase", 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func TestIndexFile(t *testing.T) {
 		t.Errorf("expected archive under manual dir, got %q", p.FilePath)
 	}
 
-	hits, err := repo.Search(ctx, "indexfile unique phrase", 10)
+	hits, err := repo.Search(ctx, "indexfile unique phrase", 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +339,7 @@ func TestTranscriptFingerprintSkipOnRun(t *testing.T) {
 		t.Fatalf("expected debug skip line, got %q", debug.String())
 	}
 
-	hits, err := repo.Search(ctx, "fingerprint skip searchable", 10)
+	hits, err := repo.Search(ctx, "fingerprint skip searchable", 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}

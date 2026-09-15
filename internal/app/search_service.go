@@ -17,7 +17,7 @@ func NewSearchService(repo domain.SearchRepository) *SearchService {
 	return &SearchService{repo: repo}
 }
 
-func (s *SearchService) Search(ctx context.Context, query string, limit int, opts domain.SearchOpts) ([]domain.SearchHit, error) {
+func (s *SearchService) Search(ctx context.Context, query string, limit int, opts domain.SearchOpts, f domain.SearchFilter) ([]domain.SearchHit, error) {
 	q := strings.TrimSpace(query)
 	if q == "" {
 		return nil, nil
@@ -32,7 +32,7 @@ func (s *SearchService) Search(ctx context.Context, query string, limit int, opt
 	if limit <= 0 {
 		limit = defaultSearchLimit
 	}
-	return s.repo.Search(ctx, compiled, limit)
+	return s.repo.Search(ctx, compiled, limit, f)
 }
 
 func (s *SearchService) Session(ctx context.Context, id string) (domain.SessionDetail, error) {

@@ -58,7 +58,7 @@ func TestSearchFindsInsertedSession(t *testing.T) {
 		t.Fatalf("replace: %v", err)
 	}
 
-	hits, err := r.Search(ctx, "unique phrase", 10)
+	hits, err := r.Search(ctx, "unique phrase", 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestClaudeDesktopVendorPersists(t *testing.T) {
 		t.Fatalf("replace: %v", err)
 	}
 
-	hits, err := r.Search(ctx, "desktop vendor", 10)
+	hits, err := r.Search(ctx, "desktop vendor", 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestSearchRequiresAllTerms(t *testing.T) {
 		t.Fatalf("replace: %v", err)
 	}
 
-	hits, err := r.Search(ctx, "alpha gamma", 10)
+	hits, err := r.Search(ctx, "alpha gamma", 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestSearchRequiresAllTerms(t *testing.T) {
 		t.Fatalf("expected 1 hit for AND query, got %d", len(hits))
 	}
 
-	hits, err = r.Search(ctx, "alpha missing", 10)
+	hits, err = r.Search(ctx, "alpha missing", 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestSearchORQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hits, err := r.Search(ctx, compiled, 10)
+	hits, err := r.Search(ctx, compiled, 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestSearchGroupedAND(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hits, err := r.Search(ctx, compiled, 10)
+	hits, err := r.Search(ctx, compiled, 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestSearchHitIncludesFilePath(t *testing.T) {
 		t.Fatalf("replace: %v", err)
 	}
 
-	hits, err := r.Search(ctx, "file path keyword", 10)
+	hits, err := r.Search(ctx, "file path keyword", 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -257,7 +257,7 @@ func TestSearchFindsSessionOutsideRecentWindow(t *testing.T) {
 		}
 	}
 
-	hits, err := r.Search(ctx, "needle outside", 10)
+	hits, err := r.Search(ctx, "needle outside", 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +283,7 @@ func TestSearchRankOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hits, err := r.Search(ctx, "gopher", 10)
+	hits, err := r.Search(ctx, "gopher", 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +385,7 @@ func TestReplaceSessionIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hits, err := r.Search(ctx, "searchable content", 10)
+	hits, err := r.Search(ctx, "searchable content", 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -424,7 +424,7 @@ func TestRecordKindPersisted(t *testing.T) {
 		t.Errorf("session detail kind = %q", detail.Session.RecordKind)
 	}
 
-	hits, err := r.Search(ctx, "shared keyword", 10)
+	hits, err := r.Search(ctx, "shared keyword", 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -583,7 +583,7 @@ func TestVendorPersistedAndFiltered(t *testing.T) {
 		t.Errorf("detail vendor: %q", detail.Session.Vendor)
 	}
 
-	hits, err := r.Search(ctx, "shared vendor keyword", 10)
+	hits, err := r.Search(ctx, "shared vendor keyword", 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -628,7 +628,7 @@ func TestNewVendorsPersistedAndFiltered(t *testing.T) {
 		t.Errorf("opencode detail vendor: %q", detail.Session.Vendor)
 	}
 
-	hits, err := r.Search(ctx, "new vendor keyword", 10)
+	hits, err := r.Search(ctx, "new vendor keyword", 10, domain.SearchFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -654,5 +654,61 @@ func TestNewVendorsPersistedAndFiltered(t *testing.T) {
 	}
 	if len(codexOnly) != 1 || codexOnly[0].Vendor != domain.VendorCodex {
 		t.Fatalf("recent codex filter: %+v", codexOnly)
+	}
+}
+
+func TestSearchAndRecentSessionsSinceFilter(t *testing.T) {
+	r := openTemp(t)
+	ctx := context.Background()
+
+	early := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	late := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	oldSession := domain.Session{
+		ID: "old", Title: "Old Session",
+		ProjectPath: "/tmp/proj", StartedAt: early, EndedAt: early,
+		HasTranscript: true, RecordKind: domain.RecordChat, Vendor: domain.VendorClaude,
+	}
+	oldMsg := domain.Message{
+		UUID: "old-m1", SessionID: "old",
+		Role: domain.RoleUser, Kind: domain.KindText,
+		Text: "sincefilter keyword old", Source: domain.SourceTranscript,
+		Timestamp: early, Sequence: 0,
+	}
+	if err := r.ReplaceSession(ctx, oldSession, []domain.Message{oldMsg}); err != nil {
+		t.Fatalf("replace old: %v", err)
+	}
+
+	newSession := domain.Session{
+		ID: "new", Title: "New Session",
+		ProjectPath: "/tmp/proj", StartedAt: late, EndedAt: late,
+		HasTranscript: true, RecordKind: domain.RecordChat, Vendor: domain.VendorClaude,
+	}
+	newMsg := domain.Message{
+		UUID: "new-m1", SessionID: "new",
+		Role: domain.RoleUser, Kind: domain.KindText,
+		Text: "sincefilter keyword new", Source: domain.SourceTranscript,
+		Timestamp: late, Sequence: 0,
+	}
+	if err := r.ReplaceSession(ctx, newSession, []domain.Message{newMsg}); err != nil {
+		t.Fatalf("replace new: %v", err)
+	}
+
+	since := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+
+	hits, err := r.Search(ctx, "sincefilter", 10, domain.SearchFilter{Since: since})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].SessionID != "new" {
+		t.Fatalf("Search since filter: got %+v", hits)
+	}
+
+	recent, err := r.RecentSessions(ctx, domain.RecentQuery{Limit: 10, ProjectPath: "/tmp/proj", Since: since})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recent) != 1 || recent[0].SessionID != "new" {
+		t.Fatalf("RecentSessions since filter: got %+v", recent)
 	}
 }

@@ -1056,7 +1056,7 @@ func doLoadRecent(svc *appSvc.SearchService, kind domain.RecordKind, project str
 
 func doSearch(svc *appSvc.SearchService, query string) tea.Cmd {
 	return func() tea.Msg {
-		hits, err := svc.Search(context.Background(), query, searchResultLimit, domain.SearchOpts{})
+		hits, err := svc.Search(context.Background(), query, searchResultLimit, domain.SearchOpts{}, domain.SearchFilter{})
 		if err != nil {
 			return errMsg{err}
 		}
