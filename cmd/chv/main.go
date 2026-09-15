@@ -365,6 +365,7 @@ func cmdMCP(args []string) {
 		Semantic:     app.NewSemanticSearchService(client, repo, repo),
 		Summarize:    app.NewSummarizeService(chatSvc, chatModel, repo, repo),
 		Patterns:     app.NewPatternService(repo, chatSvc),
+		Ask:          app.NewAskService(client, chatSvc, repo, repo),
 		EmbedModel:   embedModel,
 		HasChatModel: chatSvc != nil,
 		Version:      version,

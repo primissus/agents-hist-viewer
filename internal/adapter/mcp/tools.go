@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"claude-code-hist-viewer/internal/app"
@@ -49,6 +50,13 @@ func registerTools(s *sdk.Server, h *handlers) {
 			"repeated Bash command sequences (scripts), with representative samples and session counts. Filter with " +
 			"since/vendor/project. Requires `chv embed` to have run. No LLM is used unless label_with_llm=true.",
 	}, h.minePatterns)
+
+	sdk.AddTool(s, &sdk.Tool{
+		Name: "ask_history",
+		Description: "Retrieve the most relevant excerpts from indexed history for a question (semantic search, " +
+			"deduped per session, with neighbouring context). Returns excerpts for you to reason over; set answer=true " +
+			"to also get a local-chat-model answer. `since` accepts durations like `90d`.",
+	}, h.askHistory)
 }
 
 // --- DTOs -------------------------------------------------------------
@@ -503,4 +511,54 @@ func (h *handlers) minePatterns(ctx context.Context, _ *sdk.CallToolRequest, in 
 		Scripts: report.Scripts,
 		Labeled: in.LabelWithLLM && h.d.HasChatModel,
 	}, nil
+}
+
+// --- ask_history -----------------------------------------------------
+
+type askHistoryInput struct {
+	Question string `json:"question"`
+	K        int    `json:"k,omitempty"` // default 12, clamp 1..50
+	Since    string `json:"since,omitempty"`
+	Vendor   string `json:"vendor,omitempty"`
+	Project  string `json:"project,omitempty"`
+	Answer   bool   `json:"answer,omitempty"` // generate an answer with the local chat model
+}
+
+type askHistoryOutput struct {
+	Answer   string       `json:"answer,omitempty"`
+	Excerpts []app.AskHit `json:"excerpts"`
+}
+
+func (h *handlers) askHistory(ctx context.Context, _ *sdk.CallToolRequest, in askHistoryInput) (*sdk.CallToolResult, askHistoryOutput, error) {
+	if h.d.Ask == nil {
+		return nil, askHistoryOutput{}, errors.New("ask_history unavailable (is Ollama running?)")
+	}
+	if strings.TrimSpace(in.Question) == "" {
+		return nil, askHistoryOutput{}, errors.New("question: required")
+	}
+
+	since, err := app.SinceTime(in.Since, time.Now())
+	if err != nil {
+		return nil, askHistoryOutput{}, fmt.Errorf("since: %w", err)
+	}
+
+	k := clamp(in.K, 12, 50)
+	result, err := h.d.Ask.Ask(ctx, in.Question, app.AskOptions{
+		K:           k,
+		Vendor:      domain.Vendor(in.Vendor),
+		ProjectPath: in.Project,
+		Since:       since,
+		NoLLM:       !in.Answer,
+	})
+	if err != nil {
+		if errors.Is(err, app.ErrNoEmbeddings) {
+			return nil, askHistoryOutput{}, err
+		}
+		if h.d.OllamaURL != "" {
+			return nil, askHistoryOutput{}, fmt.Errorf("ask_history unavailable (is Ollama running at %s?): %w", h.d.OllamaURL, err)
+		}
+		return nil, askHistoryOutput{}, fmt.Errorf("ask_history unavailable (is Ollama running?): %w", err)
+	}
+
+	return nil, askHistoryOutput{Answer: result.Answer, Excerpts: result.Hits}, nil
 }

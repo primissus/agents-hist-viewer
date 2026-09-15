@@ -406,6 +406,35 @@ func TestMinePatternsInvalidSince(t *testing.T) {
 	}
 }
 
+func TestAskHistoryNilDependencyReturnsClearError(t *testing.T) {
+	h := &handlers{d: Deps{}}
+	_, _, err := h.askHistory(context.Background(), nil, askHistoryInput{Question: "anything"})
+	if err == nil {
+		t.Fatal("expected error for nil Ask dependency")
+	}
+	if !strings.Contains(err.Error(), "Ollama") {
+		t.Fatalf("expected error to mention Ollama, got: %v", err)
+	}
+}
+
+func TestAskHistoryEmptyQuestion(t *testing.T) {
+	r := seedRepo(t)
+	h := &handlers{d: Deps{Ask: app.NewAskService(nil, nil, r, r)}}
+	_, _, err := h.askHistory(context.Background(), nil, askHistoryInput{Question: "  "})
+	if err == nil || !strings.Contains(err.Error(), "question:") {
+		t.Fatalf("expected 'question:' error for empty question, got: %v", err)
+	}
+}
+
+func TestAskHistoryInvalidSince(t *testing.T) {
+	r := seedRepo(t)
+	h := &handlers{d: Deps{Ask: app.NewAskService(nil, nil, r, r)}}
+	_, _, err := h.askHistory(context.Background(), nil, askHistoryInput{Question: "anything", Since: "notaduration"})
+	if err == nil || !strings.Contains(err.Error(), "since:") {
+		t.Fatalf("expected 'since:' error for invalid duration, got: %v", err)
+	}
+}
+
 func TestSummarizeSessionNilDependencyReturnsClearError(t *testing.T) {
 	r := seedRepo(t)
 	h := &handlers{d: Deps{Search: app.NewSearchService(r)}}
@@ -465,7 +494,7 @@ func TestServerEndToEndListAndCallTools(t *testing.T) {
 	want := map[string]bool{
 		"search_history": false, "semantic_search": false, "list_sessions": false,
 		"get_session": false, "summarize_session": false,
-		"mine_patterns": false,
+		"mine_patterns": false, "ask_history": false,
 	}
 	for _, tool := range toolsRes.Tools {
 		if _, ok := want[tool.Name]; ok {

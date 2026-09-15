@@ -22,12 +22,14 @@ type Deps struct {
 	// Patterns wraps app.PatternService for the mine_patterns tool. May be
 	// nil (e.g. no embeddings repo configured).
 	Patterns *app.PatternService
+	// Ask wraps app.AskService for the ask_history tool. May be nil.
+	Ask *app.AskService
 	// EmbedModel is the embedding model name passed to PatternService.Run;
 	// it selects which stored vectors mine_patterns reads.
 	EmbedModel string
 	// HasChatModel reports whether a chat (LLM) model is configured, so
-	// mine_patterns can tell callers whether label_with_llm actually ran an
-	// LLM.
+	// mine_patterns/ask_history can tell callers whether label_with_llm/answer
+	// actually ran an LLM.
 	HasChatModel bool
 	Version      string
 
@@ -50,9 +52,11 @@ Tools:
   - get_session: fetch a session's messages, paginated and filterable by kind.
   - summarize_session: condense a session's transcript, optionally with an LLM-generated recap.
   - mine_patterns: cluster repeated user prompts/commands from embedded history (requires chv embed).
+  - ask_history: retrieve the most relevant excerpts for a question (requires chv embed).
 
 Prefer mine_patterns with since for questions about the user's recurring habits or prompting
-style; you label and interpret the clusters yourself unless label_with_llm is set.`
+style, and ask_history with since for narrower factual questions about a time window; you label
+and interpret the results yourself unless label_with_llm/answer is set.`
 
 // NewServer builds an MCP server with all chv tools registered.
 func NewServer(d Deps) *sdk.Server {
