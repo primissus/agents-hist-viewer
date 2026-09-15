@@ -42,6 +42,13 @@ func registerTools(s *sdk.Server, h *handlers) {
 		Name:        "summarize_session",
 		Description: "Condense a session's transcript, optionally with an LLM-generated structured recap (cached).",
 	}, h.summarizeSession)
+
+	sdk.AddTool(s, &sdk.Tool{
+		Name: "mine_patterns",
+		Description: "Mine repeated behaviour from embedded history: clusters of similar user prompts (skills) and " +
+			"repeated Bash command sequences (scripts), with representative samples and session counts. Filter with " +
+			"since/vendor/project. Requires `chv embed` to have run. No LLM is used unless label_with_llm=true.",
+	}, h.minePatterns)
 }
 
 // --- DTOs -------------------------------------------------------------
@@ -440,4 +447,60 @@ func (h *handlers) summarizeSession(ctx context.Context, _ *sdk.CallToolRequest,
 		out.CreatedAt = result.CreatedAt.Format(time.RFC3339)
 	}
 	return nil, out, nil
+}
+
+// --- mine_patterns -----------------------------------------------------
+
+type minePatternsInput struct {
+	Kind         string `json:"kind,omitempty"` // skills|scripts|all (default all)
+	Since        string `json:"since,omitempty"`
+	Vendor       string `json:"vendor,omitempty"`
+	Project      string `json:"project,omitempty"`
+	K            int    `json:"k,omitempty"`   // 0 = auto
+	Top          int    `json:"top,omitempty"` // default 15, clamp 1..50
+	LabelWithLLM bool   `json:"label_with_llm,omitempty"`
+}
+
+type minePatternsOutput struct {
+	Skills  []app.SkillCandidate  `json:"skills"`
+	Scripts []app.ScriptCandidate `json:"scripts"`
+	Labeled bool                  `json:"labeled"` // true only if an LLM labeled the clusters
+}
+
+func (h *handlers) minePatterns(ctx context.Context, _ *sdk.CallToolRequest, in minePatternsInput) (*sdk.CallToolResult, minePatternsOutput, error) {
+	if h.d.Patterns == nil {
+		return nil, minePatternsOutput{}, errors.New("patterns unavailable (no embeddings repo configured)")
+	}
+
+	kind := app.PatternKind(in.Kind)
+	switch kind {
+	case "", app.PatternSkills, app.PatternScripts, app.PatternAll:
+	default:
+		return nil, minePatternsOutput{}, fmt.Errorf("kind: invalid value %q (want skills, scripts, or all)", in.Kind)
+	}
+
+	since, err := app.SinceTime(in.Since, time.Now())
+	if err != nil {
+		return nil, minePatternsOutput{}, fmt.Errorf("since: %w", err)
+	}
+
+	top := clamp(in.Top, 15, 50)
+	report, err := h.d.Patterns.Run(ctx, h.d.EmbedModel, app.PatternOptions{
+		Kind:        kind,
+		K:           in.K,
+		Top:         top,
+		Vendor:      domain.Vendor(in.Vendor),
+		ProjectPath: in.Project,
+		Since:       since,
+		NoLLM:       !in.LabelWithLLM,
+	})
+	if err != nil {
+		return nil, minePatternsOutput{}, fmt.Errorf("mine_patterns: %w", err)
+	}
+
+	return nil, minePatternsOutput{
+		Skills:  report.Skills,
+		Scripts: report.Scripts,
+		Labeled: in.LabelWithLLM && h.d.HasChatModel,
+	}, nil
 }

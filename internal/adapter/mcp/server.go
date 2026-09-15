@@ -19,7 +19,17 @@ type Deps struct {
 	Search    *app.SearchService
 	Semantic  *app.SemanticSearchService
 	Summarize *app.SummarizeService
-	Version   string
+	// Patterns wraps app.PatternService for the mine_patterns tool. May be
+	// nil (e.g. no embeddings repo configured).
+	Patterns *app.PatternService
+	// EmbedModel is the embedding model name passed to PatternService.Run;
+	// it selects which stored vectors mine_patterns reads.
+	EmbedModel string
+	// HasChatModel reports whether a chat (LLM) model is configured, so
+	// mine_patterns can tell callers whether label_with_llm actually ran an
+	// LLM.
+	HasChatModel bool
+	Version      string
 
 	// OllamaURL, if set, is included in semantic-search error messages to
 	// help the caller diagnose a down/misconfigured Ollama server.
@@ -38,7 +48,11 @@ Tools:
   - semantic_search: embedding-based nearest-neighbor search (requires chv embed to have run).
   - list_sessions: browse recent sessions, optionally filtered by vendor/project/kind.
   - get_session: fetch a session's messages, paginated and filterable by kind.
-  - summarize_session: condense a session's transcript, optionally with an LLM-generated recap.`
+  - summarize_session: condense a session's transcript, optionally with an LLM-generated recap.
+  - mine_patterns: cluster repeated user prompts/commands from embedded history (requires chv embed).
+
+Prefer mine_patterns with since for questions about the user's recurring habits or prompting
+style; you label and interpret the clusters yourself unless label_with_llm is set.`
 
 // NewServer builds an MCP server with all chv tools registered.
 func NewServer(d Deps) *sdk.Server {

@@ -377,6 +377,35 @@ func TestSemanticSearchNilDependencyReturnsClearError(t *testing.T) {
 	}
 }
 
+func TestMinePatternsNilDependencyReturnsClearError(t *testing.T) {
+	h := &handlers{d: Deps{}}
+	_, _, err := h.minePatterns(context.Background(), nil, minePatternsInput{})
+	if err == nil {
+		t.Fatal("expected error for nil Patterns dependency")
+	}
+	if !strings.Contains(err.Error(), "patterns unavailable") {
+		t.Fatalf("expected 'patterns unavailable' error, got: %v", err)
+	}
+}
+
+func TestMinePatternsInvalidKind(t *testing.T) {
+	r := seedRepo(t)
+	h := &handlers{d: Deps{Patterns: app.NewPatternService(r, nil)}}
+	_, _, err := h.minePatterns(context.Background(), nil, minePatternsInput{Kind: "bogus"})
+	if err == nil || !strings.Contains(err.Error(), "kind:") {
+		t.Fatalf("expected 'kind:' error for invalid kind, got: %v", err)
+	}
+}
+
+func TestMinePatternsInvalidSince(t *testing.T) {
+	r := seedRepo(t)
+	h := &handlers{d: Deps{Patterns: app.NewPatternService(r, nil)}}
+	_, _, err := h.minePatterns(context.Background(), nil, minePatternsInput{Since: "notaduration"})
+	if err == nil || !strings.Contains(err.Error(), "since:") {
+		t.Fatalf("expected 'since:' error for invalid duration, got: %v", err)
+	}
+}
+
 func TestSummarizeSessionNilDependencyReturnsClearError(t *testing.T) {
 	r := seedRepo(t)
 	h := &handlers{d: Deps{Search: app.NewSearchService(r)}}
@@ -436,6 +465,7 @@ func TestServerEndToEndListAndCallTools(t *testing.T) {
 	want := map[string]bool{
 		"search_history": false, "semantic_search": false, "list_sessions": false,
 		"get_session": false, "summarize_session": false,
+		"mine_patterns": false,
 	}
 	for _, tool := range toolsRes.Tools {
 		if _, ok := want[tool.Name]; ok {

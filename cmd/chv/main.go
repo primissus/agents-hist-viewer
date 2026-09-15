@@ -353,7 +353,7 @@ func cmdMCP(args []string) {
 	repo := openDBOrExit(*dbFlag, true)
 	defer repo.Close()
 
-	client, _, chatModel := ollamaFlags.resolve(indexCfg)
+	client, embedModel, chatModel := ollamaFlags.resolve(indexCfg)
 
 	var chatSvc domain.ChatModel = client
 	if *noLLMFlag {
@@ -361,11 +361,14 @@ func cmdMCP(args []string) {
 	}
 
 	deps := mcpadapter.Deps{
-		Search:    app.NewSearchService(repo),
-		Semantic:  app.NewSemanticSearchService(client, repo, repo),
-		Summarize: app.NewSummarizeService(chatSvc, chatModel, repo, repo),
-		Version:   version,
-		OllamaURL: resolveOllamaURL(ollamaFlags, indexCfg),
+		Search:       app.NewSearchService(repo),
+		Semantic:     app.NewSemanticSearchService(client, repo, repo),
+		Summarize:    app.NewSummarizeService(chatSvc, chatModel, repo, repo),
+		Patterns:     app.NewPatternService(repo, chatSvc),
+		EmbedModel:   embedModel,
+		HasChatModel: chatSvc != nil,
+		Version:      version,
+		OllamaURL:    resolveOllamaURL(ollamaFlags, indexCfg),
 	}
 	if *debugFlag {
 		deps.Logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
