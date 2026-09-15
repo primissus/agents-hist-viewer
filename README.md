@@ -189,10 +189,10 @@ a1b2c3d4-…  Fix login redirect [prompt-only]
 --semantic      semantic (embedding) search instead of full-text search
 --vendor NAME   filter by vendor (--semantic only)
 --project PATH  filter by project path (--semantic only)
---since DUR     only messages since duration ago, e.g. 30d (--semantic only)
+--since DUR     only messages since duration ago, e.g. 30d
 ```
 
-`--fuzzy` cannot be combined with `--semantic` (usage error), and `--vendor`/`--project`/`--since` require `--semantic` — plain FTS search has no filters and passing them without `--semantic` is also a usage error.
+`--fuzzy` cannot be combined with `--semantic` (usage error). `--since` works in both modes; `--vendor`/`--project` require `--semantic` — plain FTS search has no such filters and passing them without `--semantic` is a usage error.
 
 **Query syntax** (compiled to FTS5, FTS mode only):
 
@@ -303,10 +303,12 @@ Runs chv as an MCP ([Model Context Protocol](https://modelcontextprotocol.io)) s
 
 ```
 --db PATH     override DB file location
---model NAME  embedding model (for semantic_search)
---chat NAME   chat model (for summarize_session)
+--model NAME  embedding model (for semantic_search, mine_patterns, ask_history)
+--chat NAME   chat model (for summarize_session, mine_patterns label_with_llm, ask_history answer)
 --ollama URL  Ollama base URL
---no-llm      don't construct a chat-capable summarizer; summarize_session only works with condensed_only:true
+--no-llm      don't construct a chat-capable summarizer/labeler/answerer; summarize_session only
+              works with condensed_only:true, and mine_patterns/ask_history ignore
+              label_with_llm/answer instead of erroring
 --debug       log server activity to stderr
 ```
 
@@ -314,13 +316,17 @@ Tools exposed:
 
 | Tool | Purpose |
 |------|---------|
-| `search_history` | Full-text (FTS5) search over indexed sessions. |
+| `search_history` | Full-text (FTS5) search over indexed sessions, optionally filtered by `since`. |
 | `semantic_search` | Embedding-based nearest-neighbor search (requires `chv embed` to have run). |
-| `list_sessions` | Browse recent sessions, optionally filtered by vendor/project/kind. |
+| `list_sessions` | Browse recent sessions, optionally filtered by vendor/project/kind/`since`. |
 | `get_session` | Fetch a session's messages, paginated and filterable by kind. |
 | `summarize_session` | Condense a session's transcript, optionally with a cached LLM-generated recap. |
+| `mine_patterns` | Cluster repeated user prompts (skills) and Bash command sequences (scripts) from embedded history, filterable by since/vendor/project. Requires `chv embed`. |
+| `ask_history` | Retrieve the most relevant excerpts for a question (semantic search, deduped per session, with neighbouring context), filterable by since/vendor/project. Requires `chv embed`. |
 
-`semantic_search` and `summarize_session` (unless called with `condensed_only: true`) need a reachable Ollama server — same requirement as `chv search --semantic`/`chv ask`/`chv summarize`.
+`semantic_search`, `summarize_session` (unless called with `condensed_only: true`), and `ask_history` need a reachable Ollama server for the embedding model — same requirement as `chv search --semantic`/`chv ask`/`chv summarize`.
+
+**Embedding-only mode (`chv mcp --no-llm`)** — every tool still works, just without LLM labeling/answers/recaps: only the embedding model (not a chat model) is needed, for `semantic_search`'s and `ask_history`'s query embedding. `mine_patterns` reads only stored vectors from SQLite and needs no Ollama server reachable at all — its `label_with_llm` flag is simply ignored (no error) when no chat model is configured. Example: `mine_patterns {"kind":"skills","since":"90d"}` returns raw clusters and samples for the calling model (e.g. Claude Code) to label and interpret itself, with no local chat model in the loop.
 
 **Register with Claude Code:**
 
