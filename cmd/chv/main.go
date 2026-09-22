@@ -35,7 +35,7 @@ import (
 // version is the chv build version reported to MCP clients. It is overridden
 // at release time via -ldflags "-X main.version=<tag>" (see .goreleaser.yml);
 // local builds report the default below.
-var version = "0.2.0"
+var version = "0.3.0"
 
 func main() {
 	if len(os.Args) < 2 {
