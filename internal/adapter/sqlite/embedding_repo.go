@@ -1,13 +1,15 @@
 package sqlite
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -96,10 +98,14 @@ func (r *Repo) PutEmbeddings(ctx context.Context, embs []domain.Embedding) error
 	defer tx.Rollback()
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	texts, err := messageTexts(ctx, tx, embs)
+	if err != nil {
+		return err
+	}
 	for _, e := range embs {
-		var text string
-		if err := tx.QueryRowContext(ctx, `SELECT text FROM messages WHERE rowid = ?`, e.MessageRowID).Scan(&text); err != nil {
-			return fmt.Errorf("lookup message %d: %w", e.MessageRowID, err)
+		text, ok := texts[e.MessageRowID]
+		if !ok {
+			return fmt.Errorf("lookup message %d: not found", e.MessageRowID)
 		}
 		vec := normalizeVector(e.Vector)
 		_, err := tx.ExecContext(ctx,
@@ -114,6 +120,40 @@ func (r *Repo) PutEmbeddings(ctx context.Context, embs []domain.Embedding) error
 		}
 	}
 	return tx.Commit()
+}
+
+// messageTexts resolves the stored text for every rowid in embs with a single
+// query, avoiding a SELECT per embedding.
+func messageTexts(ctx context.Context, tx *sql.Tx, embs []domain.Embedding) (map[int64]string, error) {
+	seen := make(map[int64]struct{}, len(embs))
+	placeholders := make([]string, 0, len(embs))
+	args := make([]any, 0, len(embs))
+	for _, e := range embs {
+		if _, ok := seen[e.MessageRowID]; ok {
+			continue
+		}
+		seen[e.MessageRowID] = struct{}{}
+		placeholders = append(placeholders, "?")
+		args = append(args, e.MessageRowID)
+	}
+
+	rows, err := tx.QueryContext(ctx,
+		`SELECT rowid, text FROM messages WHERE rowid IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[int64]string, len(seen))
+	for rows.Next() {
+		var id int64
+		var text string
+		if err := rows.Scan(&id, &text); err != nil {
+			return nil, err
+		}
+		out[id] = text
+	}
+	return out, rows.Err()
 }
 
 func (r *Repo) Nearest(ctx context.Context, model string, q []float32, k int, f domain.EmbedFilter) ([]domain.VectorHit, error) {
@@ -132,7 +172,7 @@ WHERE e.model = ?`
 	}
 	defer rows.Close()
 
-	qn := normalizeVector(q)
+	qNorm := vectorNorm(q)
 	var hits []domain.VectorHit
 	for rows.Next() {
 		var rowID int64
@@ -144,14 +184,16 @@ WHERE e.model = ?`
 		hits = append(hits, domain.VectorHit{
 			MessageRowID: rowID,
 			SessionID:    sessionID,
-			Score:        domain.Cosine(qn, decodeVector(blob)),
+			Score:        cosineBlob(q, qNorm, blob),
 		})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	sort.Slice(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
+	slices.SortFunc(hits, func(a, b domain.VectorHit) int {
+		return cmp.Compare(b.Score, a.Score)
+	})
 	if k > 0 && len(hits) > k {
 		hits = hits[:k]
 	}
@@ -331,6 +373,33 @@ func normalizeVector(v []float32) []float32 {
 		out[i] = f / norm
 	}
 	return out
+}
+
+func vectorNorm(v []float32) float64 {
+	var sumSq float64
+	for _, f := range v {
+		sumSq += float64(f) * float64(f)
+	}
+	return math.Sqrt(sumSq)
+}
+
+// cosineBlob computes the cosine similarity between the query and a stored
+// little-endian float32 blob without decoding the vector into a slice.
+func cosineBlob(q []float32, qNorm float64, b []byte) float64 {
+	n := len(b) / 4
+	if n > len(q) {
+		n = len(q)
+	}
+	var dot, bNormSq float64
+	for i := 0; i < n; i++ {
+		f := float64(math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:])))
+		dot += float64(q[i]) * f
+		bNormSq += f * f
+	}
+	if qNorm == 0 || bNormSq == 0 {
+		return 0
+	}
+	return dot / (qNorm * math.Sqrt(bNormSq))
 }
 
 func textHash(s string) string {

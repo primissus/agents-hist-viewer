@@ -52,31 +52,19 @@ func (r *Repo) ReplaceSession(ctx context.Context, s domain.Session, msgs []doma
 	}
 	defer tx.Rollback()
 
-	// Collect rowids to delete from fts before deleting messages.
-	rows, err := tx.QueryContext(ctx, `SELECT rowid FROM messages WHERE session_id = ?`, s.ID)
-	if err != nil {
+	// messages_fts has no external-content link, so deleting the session's
+	// messages does not clear their index rows: delete them first, in one
+	// statement, before the DELETE below removes the source rows.
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM messages_fts WHERE rowid IN (SELECT rowid FROM messages WHERE session_id = ?)`,
+		s.ID,
+	); err != nil {
 		return err
 	}
-	var rowids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		rowids = append(rowids, id)
-	}
-	rows.Close()
 
 	preserved, err := preservedEmbeddings(ctx, tx, s.ID)
 	if err != nil {
 		return err
-	}
-
-	for _, rid := range rowids {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM messages_fts WHERE rowid = ?`, rid); err != nil {
-			return err
-		}
 	}
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE session_id = ?`, s.ID); err != nil {

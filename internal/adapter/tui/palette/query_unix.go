@@ -24,6 +24,12 @@ func QueryTerminal(indices []int) (map[int]string, error) {
 	}
 	defer tty.Close()
 
+	// Disable ECHO while querying so the tty line discipline does not echo the
+	// terminal's OSC 4 responses back onto the screen before we read them.
+	if state, err := term.MakeRaw(tty.Fd()); err == nil {
+		defer term.Restore(tty.Fd(), state) //nolint: errcheck
+	}
+
 	got, err := QueryPalette(tty, tty, indices)
 	drainFD(tty.Fd(), drainWindow)
 	return got, err
