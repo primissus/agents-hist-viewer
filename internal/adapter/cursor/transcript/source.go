@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"claude-code-hist-viewer/internal/domain"
@@ -20,6 +21,9 @@ import (
 type Source struct {
 	root string
 	opts domain.IndexOptions
+
+	mu    sync.Mutex
+	paths map[string]string // chat id -> main jsonl path
 }
 
 func NewSource(root string, opts domain.IndexOptions) *Source {
@@ -99,7 +103,6 @@ func (s *Source) Sessions(ctx context.Context) ([]domain.Session, error) {
 		if !proj.IsDir() {
 			continue
 		}
-		projectPath := decodeProjectPath(proj.Name())
 		transcriptRoot := filepath.Join(s.root, proj.Name(), "agent-transcripts")
 		chats, err := os.ReadDir(transcriptRoot)
 		if err != nil {
@@ -111,12 +114,12 @@ func (s *Source) Sessions(ctx context.Context) ([]domain.Session, error) {
 			}
 			chatID := chat.Name()
 			filePath := filepath.Join(transcriptRoot, chatID, chatID+".jsonl")
-			info, err := os.Stat(filePath)
+			sess, err := s.sessionFromFile(filePath, chatID)
 			if err != nil {
 				continue
 			}
-			meta := scanMeta(filePath, chatID, projectPath, info.ModTime().UTC())
-			sessions = append(sessions, meta)
+			s.rememberPath(chatID, filePath)
+			sessions = append(sessions, sess)
 		}
 	}
 
@@ -124,6 +127,79 @@ func (s *Source) Sessions(ctx context.Context) ([]domain.Session, error) {
 		return sessions[i].StartedAt.After(sessions[j].StartedAt)
 	})
 	return sessions, nil
+}
+
+// TranscriptCatalog lists sessions with stat-only fingerprints so callers can
+// skip unchanged transcripts without parsing them.
+func (s *Source) TranscriptCatalog(ctx context.Context) ([]domain.TranscriptCatalogEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var out []domain.TranscriptCatalogEntry
+	for _, proj := range entries {
+		if !proj.IsDir() {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		transcriptRoot := filepath.Join(s.root, proj.Name(), "agent-transcripts")
+		chats, err := os.ReadDir(transcriptRoot)
+		if err != nil {
+			continue
+		}
+		for _, chat := range chats {
+			if !chat.IsDir() {
+				continue
+			}
+			chatID := chat.Name()
+			filePath := filepath.Join(transcriptRoot, chatID, chatID+".jsonl")
+			if _, err := os.Stat(filePath); err != nil {
+				continue
+			}
+			paths := append([]string{filePath}, cursorSidechainPaths(filePath)...)
+			fp, err := transcriptFingerprintForFiles(paths, s.opts)
+			if err != nil {
+				continue
+			}
+			s.rememberPath(chatID, filePath)
+			out = append(out, domain.TranscriptCatalogEntry{
+				ID:          SessionID(chatID),
+				Vendor:      domain.VendorCursor,
+				Fingerprint: fp,
+			})
+		}
+	}
+	return out, nil
+}
+
+// SessionMeta loads metadata for a single session without walking the source.
+func (s *Source) SessionMeta(ctx context.Context, sessionID string) (domain.Session, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.Session{}, err
+	}
+	chatID := strings.TrimPrefix(sessionID, "cursor:")
+	filePath, err := s.findFile(chatID)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	return s.sessionFromFile(filePath, chatID)
+}
+
+func (s *Source) sessionFromFile(filePath, chatID string) (domain.Session, error) {
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	return scanMeta(filePath, chatID, projectPathForFile(filePath), info.ModTime().UTC()), nil
 }
 
 func (s *Source) Messages(ctx context.Context, sessionID string, yield func(domain.Message) error) error {
@@ -176,6 +252,13 @@ func (s *Source) TranscriptFingerprint(ctx context.Context, sessionID string) (d
 }
 
 func (s *Source) findFile(chatID string) (string, error) {
+	s.mu.Lock()
+	cached, ok := s.paths[chatID]
+	s.mu.Unlock()
+	if ok {
+		return cached, nil
+	}
+
 	entries, err := os.ReadDir(s.root)
 	if err != nil {
 		return "", err
@@ -186,10 +269,20 @@ func (s *Source) findFile(chatID string) (string, error) {
 		}
 		p := filepath.Join(s.root, proj.Name(), "agent-transcripts", chatID, chatID+".jsonl")
 		if _, err := os.Stat(p); err == nil {
+			s.rememberPath(chatID, p)
 			return p, nil
 		}
 	}
 	return "", os.ErrNotExist
+}
+
+func (s *Source) rememberPath(chatID, filePath string) {
+	s.mu.Lock()
+	if s.paths == nil {
+		s.paths = make(map[string]string)
+	}
+	s.paths[chatID] = filePath
+	s.mu.Unlock()
 }
 
 func cursorSidechainPaths(filePath string) []string {

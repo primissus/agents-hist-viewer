@@ -60,9 +60,10 @@ skills/
 
 - `TranscriptSource` — list sessions, stream messages
 - `TranscriptFingerprintSource` — optional transcript content fingerprint for skip logic
+- `TranscriptCatalogSource` / `TranscriptMetaSource` — optional stat-only catalog for skipping unchanged files without parsing them, plus single-session metadata for changed ones (implemented by the Claude and Cursor transcript sources)
 - `PromptLog` — list typed prompts
 - `PlanSource` — list plan file paths to index
-- `SearchRepository` — init, replace session, file hash, search, recent, session detail, `SessionsByIDs` (batch session lookup for semantic-search hydration)
+- `SearchRepository` — init, replace session, file hash (single + batch `FileHashes`), search, recent, session detail, `SessionsByIDs` (batch session lookup for semantic-search hydration)
 - `Embedder` — embed texts into vectors (Ollama)
 - `ChatModel` — answer a system+user prompt (Ollama)
 - `EmbeddingRepository` — embeddings CRUD, nearest-neighbor + clustering reads, Bash command reads, message-by-rowid/neighbors
@@ -72,7 +73,7 @@ New I/O/storage backends implement these interfaces; logic stays in `internal/ap
 
 ## Data flow
 
-1. **Index** (`IndexService.Run`): union sessions from all `TranscriptSource` adapters + orphaned history-only sessions → `ReplaceSession` per ID (full replace, idempotent). Then index Claude plans (fd/config) and Cursor plans (`~/.cursor/plans`), with content-hash skip via `file_hashes`.
+1. **Index** (`IndexService.Run`): union sessions from all `TranscriptSource` adapters + orphaned history-only sessions → `ReplaceSession` per ID (full replace, idempotent). Sources exposing a catalog are listed stat-only and compared against stored `file_hashes` (loaded once via `FileHashes`), so unchanged transcripts are never parsed; prompt-only sessions compare a digest of their prompts (`history:<id>` key). Then index Claude plans (fd/config) and Cursor plans (`~/.cursor/plans`), with content-hash skip via `file_hashes`.
 2. **Search** (`SearchService`): trims and compiles user query syntax (`AND`/`OR`/groups/phrases/NOT/fuzzy) to FTS5; empty query returns nil.
 3. **View** (`ViewService`): validates/detects a single Claude/Cursor/Codex JSONL transcript and builds `SessionDetail` directly; no DB writes.
 4. **TUI** (`tui.Model`): home loads 100 recent sessions (`RecentQuery` supports path/type/vendor filters); `/` search hits full FTS (limit 500 unique sessions); query history in `config.SearchHistoryPath()`. `NewDetailApp` opens a prebuilt thread for `chv view`.
@@ -105,8 +106,8 @@ Config: `index.json` also holds `embed_model` / `chat_model` / `ollama_url` (`in
 
 | Area | Notes |
 |------|-------|
-| `adapter/transcript` | `~/.claude/projects/<proj>/<id>.jsonl`, sidechains. `VendorClaude`. Title from `custom-title`/`ai-title`. |
-| `adapter/cursor/transcript` | `~/.cursor/projects/<proj>/agent-transcripts/<id>/<id>.jsonl` + `subagents/*.jsonl`. IDs `cursor:<id>`. Project path decoded from folder name. |
+| `adapter/transcript` | `~/.claude/projects/<proj>/<id>.jsonl`, sidechains. `VendorClaude`. Title from `custom-title`/`ai-title`. Stat-only `TranscriptCatalog`; `SessionMeta` for changed files; id→path cache. |
+| `adapter/cursor/transcript` | `~/.cursor/projects/<proj>/agent-transcripts/<id>/<id>.jsonl` + `subagents/*.jsonl`. IDs `cursor:<id>`. Project path decoded from folder name. Stat-only `TranscriptCatalog`; `SessionMeta`; id→path cache. |
 | `adapter/cursor/plan` | `~/.cursor/plans/*.plan.md`. IDs `cursor-plan:<hash>`. Title from frontmatter `name`, then `# Heading`, then filename. |
 | `adapter/codex/transcript` | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` envelopes. IDs `codex:<thread-id>`. Title from first user text. `LoadFile` for `chv view`; size+mtime fingerprint. |
 | `adapter/opencode/transcript` | `opencode.db` read-only via `file:<path>?mode=ro`. Root sessions only (`parent_id IS NULL`); children → `IsSidechain`. IDs `opencode:<ses_id>`. Fingerprint = `time_updated` + message count. |

@@ -93,6 +93,57 @@ func TestSessionsDeriveTitleFromTaggedPrompt(t *testing.T) {
 	}
 }
 
+func TestTranscriptCatalogMatchesFingerprintAndMeta(t *testing.T) {
+	root := t.TempDir()
+	proj := filepath.Join(root, "Users-user1-src-demo")
+	if err := os.MkdirAll(filepath.Join(proj, "agent-transcripts", "chat-cat"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	jsonl := filepath.Join(proj, "agent-transcripts", "chat-cat", "chat-cat.jsonl")
+	content := `{"role":"user","message":{"content":[{"type":"text","text":"catalog cursor phrase"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"reply here"}]}}`
+	if err := os.WriteFile(jsonl, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	src := transcript.NewSource(root, domain.DefaultIndexOptions)
+	entries, err := src.TranscriptCatalog(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("catalog entries = %d, want 1", len(entries))
+	}
+	if entries[0].ID != "cursor:chat-cat" {
+		t.Fatalf("entry id = %q", entries[0].ID)
+	}
+	if entries[0].Vendor != domain.VendorCursor {
+		t.Fatalf("entry vendor = %q", entries[0].Vendor)
+	}
+	fp, err := src.TranscriptFingerprint(t.Context(), entries[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries[0].Fingerprint != fp {
+		t.Fatalf("catalog fingerprint %+v != TranscriptFingerprint %+v", entries[0].Fingerprint, fp)
+	}
+
+	sessions, err := src.Sessions(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1", len(sessions))
+	}
+	meta, err := src.SessionMeta(t.Context(), "cursor:chat-cat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.ID != sessions[0].ID || meta.Title != sessions[0].Title || meta.ProjectPath != sessions[0].ProjectPath || meta.StartedAt != sessions[0].StartedAt || meta.MessageCount != sessions[0].MessageCount {
+		t.Fatalf("session meta %+v != discovered session %+v", meta, sessions[0])
+	}
+}
+
 func TestLoadFileBuildsSessionDetail(t *testing.T) {
 	root := t.TempDir()
 	proj := filepath.Join(root, "Users-user1-src-demo")

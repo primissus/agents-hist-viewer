@@ -22,7 +22,7 @@
 - **Status:** current
 
 ## [initial] · Full-replace indexing with content-hash skip
-- **Decision:** every index run re-reads sources but skips unchanged files via SHA content hash stored in `file_hashes`; sessions are fully replaced per ID (idempotent).
+- **Decision:** every index run re-reads sources but skips unchanged files via SHA content hash stored in `file_hashes`; sessions are fully replaced per ID (idempotent). Sources that expose a stat-only catalog (Claude, Cursor) are never parsed when unchanged; prompt-only sessions compare a digest of their prompts.
 - **Why:** simple, safe against partial writes; `--force` bypasses skips.
 - **Rejected:** incremental append/diff indexing (complex for transcripts).
 - **Status:** current

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"claude-code-hist-viewer/internal/domain"
@@ -20,6 +21,9 @@ import (
 type Source struct {
 	root string
 	opts domain.IndexOptions
+
+	mu    sync.Mutex
+	paths map[string]string // session id -> main jsonl path
 }
 
 func NewSource(root string, opts domain.IndexOptions) *Source {
@@ -148,23 +152,11 @@ func (s *Source) Sessions(ctx context.Context) ([]domain.Session, error) {
 			}
 			sessionID := strings.TrimSuffix(f.Name(), ".jsonl")
 			filePath := filepath.Join(projDir, f.Name())
-			meta, err := scanSessionMeta(filePath, sessionID)
+			sess, err := s.sessionFromFile(filePath, sessionID)
 			if err != nil {
 				continue
 			}
-			sess := meta.session
-			sess.FilePath = filePath
-			sess.HasTranscript = true
-			sess.ID = sessionID
-			sess.Vendor = domain.VendorClaude
-			sess.MessageCount = meta.msgCount
-			sess.StartedAt = meta.minTS
-			sess.EndedAt = meta.maxTS
-			if meta.customTitle != "" {
-				sess.Title = meta.customTitle
-			} else if meta.aiTitle != "" {
-				sess.Title = meta.aiTitle
-			}
+			s.rememberPath(sessionID, filePath)
 			sessions = append(sessions, sess)
 		}
 	}
@@ -173,6 +165,88 @@ func (s *Source) Sessions(ctx context.Context) ([]domain.Session, error) {
 		return sessions[i].StartedAt.After(sessions[j].StartedAt)
 	})
 	return sessions, nil
+}
+
+// TranscriptCatalog lists sessions with stat-only fingerprints so callers can
+// skip unchanged transcripts without parsing them.
+func (s *Source) TranscriptCatalog(ctx context.Context) ([]domain.TranscriptCatalogEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var out []domain.TranscriptCatalogEntry
+	for _, proj := range entries {
+		if !proj.IsDir() {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		projDir := filepath.Join(s.root, proj.Name())
+		files, err := os.ReadDir(projDir)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if f.IsDir() || !strings.HasSuffix(f.Name(), ".jsonl") {
+				continue
+			}
+			sessionID := strings.TrimSuffix(f.Name(), ".jsonl")
+			filePath := filepath.Join(projDir, f.Name())
+			paths := append([]string{filePath}, claudeSidechainPaths(filePath, sessionID)...)
+			fp, err := transcriptFingerprintForFiles(paths, s.opts)
+			if err != nil {
+				continue
+			}
+			s.rememberPath(sessionID, filePath)
+			out = append(out, domain.TranscriptCatalogEntry{
+				ID:          sessionID,
+				Vendor:      domain.VendorClaude,
+				Fingerprint: fp,
+			})
+		}
+	}
+	return out, nil
+}
+
+// SessionMeta loads metadata for a single session without walking the source.
+func (s *Source) SessionMeta(ctx context.Context, sessionID string) (domain.Session, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.Session{}, err
+	}
+	filePath, err := s.findFile(sessionID)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	return s.sessionFromFile(filePath, sessionID)
+}
+
+func (s *Source) sessionFromFile(filePath, sessionID string) (domain.Session, error) {
+	meta, err := scanSessionMeta(filePath, sessionID)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	sess := meta.session
+	sess.FilePath = filePath
+	sess.HasTranscript = true
+	sess.ID = sessionID
+	sess.Vendor = domain.VendorClaude
+	sess.MessageCount = meta.msgCount
+	sess.StartedAt = meta.minTS
+	sess.EndedAt = meta.maxTS
+	if meta.customTitle != "" {
+		sess.Title = meta.customTitle
+	} else if meta.aiTitle != "" {
+		sess.Title = meta.aiTitle
+	}
+	return sess, nil
 }
 
 func (s *Source) Messages(ctx context.Context, sessionID string, yield func(domain.Message) error) error {
@@ -232,6 +306,13 @@ func (s *Source) TranscriptFingerprint(ctx context.Context, sessionID string) (d
 }
 
 func (s *Source) findFile(sessionID string) (string, error) {
+	s.mu.Lock()
+	cached, ok := s.paths[sessionID]
+	s.mu.Unlock()
+	if ok {
+		return cached, nil
+	}
+
 	entries, err := os.ReadDir(s.root)
 	if err != nil {
 		return "", err
@@ -242,10 +323,20 @@ func (s *Source) findFile(sessionID string) (string, error) {
 		}
 		p := filepath.Join(s.root, proj.Name(), sessionID+".jsonl")
 		if _, err := os.Stat(p); err == nil {
+			s.rememberPath(sessionID, p)
 			return p, nil
 		}
 	}
 	return "", os.ErrNotExist
+}
+
+func (s *Source) rememberPath(sessionID, filePath string) {
+	s.mu.Lock()
+	if s.paths == nil {
+		s.paths = make(map[string]string)
+	}
+	s.paths[sessionID] = filePath
+	s.mu.Unlock()
 }
 
 func claudeSidechainPaths(filePath, sessionID string) []string {

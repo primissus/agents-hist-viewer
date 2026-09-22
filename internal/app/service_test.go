@@ -53,6 +53,43 @@ func (f *fakePromptLog) Prompts(_ context.Context) ([]domain.Prompt, error) {
 	return f.prompts, nil
 }
 
+// fakeCatalogSource exposes a catalog and per-session metadata so the index
+// can skip unchanged sessions without calling Sessions.
+type fakeCatalogSource struct {
+	entries   []domain.TranscriptCatalogEntry
+	metas     map[string]domain.Session
+	msgs      map[string][]domain.Message
+	metaCalls map[string]int
+	msgCalls  map[string]int
+}
+
+func (f *fakeCatalogSource) Sessions(_ context.Context) ([]domain.Session, error) {
+	return nil, os.ErrInvalid
+}
+
+func (f *fakeCatalogSource) TranscriptCatalog(_ context.Context) ([]domain.TranscriptCatalogEntry, error) {
+	return f.entries, nil
+}
+
+func (f *fakeCatalogSource) SessionMeta(_ context.Context, id string) (domain.Session, error) {
+	f.metaCalls[id]++
+	sess, ok := f.metas[id]
+	if !ok {
+		return domain.Session{}, os.ErrNotExist
+	}
+	return sess, nil
+}
+
+func (f *fakeCatalogSource) Messages(_ context.Context, id string, yield func(domain.Message) error) error {
+	f.msgCalls[id]++
+	for _, m := range f.msgs[id] {
+		if err := yield(m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 type fakePlanSource struct{ paths []string }
 
 func (f *fakePlanSource) PlanPaths(_ context.Context) ([]string, error) {
@@ -464,5 +501,123 @@ func TestTranscriptFingerprintForceBypassesSkip(t *testing.T) {
 	}
 	if src.messageCalls["sess-force"] != 2 {
 		t.Fatalf("expected messages to load twice, got %d", src.messageCalls["sess-force"])
+	}
+}
+
+func TestPromptOnlySkipOnRun(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	ts := time.Now().UTC()
+
+	src := &fakeTranscriptSource{sessions: nil, msgs: nil}
+	log := &fakePromptLog{prompts: []domain.Prompt{
+		{SessionID: "sess-prompt", Text: "prompt only unique phrase", Project: "/proj", Timestamp: ts, Seq: 0},
+	}}
+
+	repo := openRepo(t)
+	svc := app.NewIndexService(src, log, nil, repo, domain.DefaultShrinkConfig)
+
+	stats1, err := svc.Run(ctx, config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats1.Orphaned != 1 || stats1.Messages != 1 {
+		t.Fatalf("expected first run to index prompt-only session, got %+v", stats1)
+	}
+
+	stats2, err := svc.Run(ctx, config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats2.Orphaned != 1 || stats2.Skipped != 1 || stats2.Messages != 0 {
+		t.Fatalf("expected second run to skip unchanged prompts, got %+v", stats2)
+	}
+
+	stats3, err := svc.RunWithOptions(ctx, config.IndexConfig{}, home, nil, app.IndexRunOptions{Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats3.Messages != 1 {
+		t.Fatalf("expected force to re-index prompts, got %+v", stats3)
+	}
+
+	hits, err := repo.Search(ctx, "prompt only unique", 10, domain.SearchFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("expected prompt-only session to remain searchable")
+	}
+}
+
+func TestCatalogSourceSkipOnRun(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	ts := time.Now().UTC()
+	fp := domain.TranscriptFingerprint{Path: filepath.Join(home, "catalog.jsonl"), Hash: "transcript-meta-v1:catalog"}
+
+	src := &fakeCatalogSource{
+		entries: []domain.TranscriptCatalogEntry{{ID: "sess-cat", Vendor: domain.VendorClaude, Fingerprint: fp}},
+		metas: map[string]domain.Session{"sess-cat": {
+			ID: "sess-cat", Title: "Catalog", HasTranscript: true,
+			FilePath: fp.Path, StartedAt: ts, EndedAt: ts,
+		}},
+		msgs: map[string][]domain.Message{
+			"sess-cat": {{
+				UUID: "m1", SessionID: "sess-cat",
+				Role: domain.RoleUser, Kind: domain.KindText,
+				Text: "catalog skip phrase", Source: domain.SourceTranscript,
+				Timestamp: ts, Sequence: 0,
+			}},
+		},
+		metaCalls: map[string]int{},
+		msgCalls:  map[string]int{},
+	}
+
+	repo := openRepo(t)
+	svc := app.NewIndexService(src, &fakePromptLog{}, nil, repo, domain.DefaultShrinkConfig)
+
+	stats1, err := svc.Run(ctx, config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats1.Skipped != 0 || stats1.Messages != 1 {
+		t.Fatalf("expected first run to index catalog session, got %+v", stats1)
+	}
+
+	stats2, err := svc.Run(ctx, config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats2.Skipped != 1 || stats2.Messages != 0 {
+		t.Fatalf("expected second run to skip catalog session, got %+v", stats2)
+	}
+	if src.metaCalls["sess-cat"] != 1 || src.msgCalls["sess-cat"] != 1 {
+		t.Fatalf("expected unchanged session not to be parsed again, meta=%d msgs=%d", src.metaCalls["sess-cat"], src.msgCalls["sess-cat"])
+	}
+
+	src.entries[0].Fingerprint.Hash = "transcript-meta-v1:changed"
+	stats3, err := svc.Run(ctx, config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats3.Messages != 1 {
+		t.Fatalf("expected changed fingerprint to re-index, got %+v", stats3)
+	}
+
+	stats4, err := svc.RunWithOptions(ctx, config.IndexConfig{}, home, nil, app.IndexRunOptions{Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats4.Messages != 1 {
+		t.Fatalf("expected force to re-index catalog session, got %+v", stats4)
+	}
+
+	detail, err := repo.SessionByID(ctx, "sess-cat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Session.Title != "Catalog" {
+		t.Fatalf("title = %q, want metadata from SessionMeta", detail.Session.Title)
 	}
 }

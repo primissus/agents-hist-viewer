@@ -2,11 +2,14 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	cursorplan "claude-code-hist-viewer/internal/adapter/cursor/plan"
@@ -57,6 +60,25 @@ func (s *IndexService) Run(ctx context.Context, indexCfg config.IndexConfig, hom
 	return s.RunWithOptions(ctx, indexCfg, home, progress, IndexRunOptions{})
 }
 
+// discoveredTranscript is a session found during discovery. Exactly one of
+// session/catalog is the primary source; the other, when set, carries richer
+// metadata merged in at write time (catalog entries have no metadata, legacy
+// Sessions cannot skip without parsing).
+type discoveredTranscript struct {
+	source  domain.TranscriptSource
+	session *domain.Session
+	catalog *domain.TranscriptCatalogEntry
+	meta    domain.TranscriptMetaSource
+}
+
+// indexRun carries per-run state shared by the session handlers.
+type indexRun struct {
+	svc    *IndexService
+	opts   IndexRunOptions
+	hashes map[string]string
+	stats  *IndexStats
+}
+
 func (s *IndexService) RunWithOptions(ctx context.Context, indexCfg config.IndexConfig, home string, progress func(done, total int), opts IndexRunOptions) (IndexStats, error) {
 	start := time.Now()
 	debugf(opts.Debug, "index start force=%t shrink_enabled=%t shrink_cap=%d", opts.Force, s.cfg.Enabled, s.cfg.ToolPayloadCap)
@@ -64,20 +86,46 @@ func (s *IndexService) RunWithOptions(ctx context.Context, indexCfg config.Index
 	if err := s.repo.Init(ctx); err != nil {
 		return IndexStats{}, fmt.Errorf("init: %w", err)
 	}
+	hashes, err := s.repo.FileHashes(ctx)
+	if err != nil {
+		return IndexStats{}, fmt.Errorf("file hashes: %w", err)
+	}
+	debugf(opts.Debug, "loaded file hashes=%d", len(hashes))
 
-	tMap := make(map[string]domain.Session)
-	tSource := make(map[string]domain.TranscriptSource)
+	dMap := make(map[string]discoveredTranscript)
 	for _, src := range s.transcripts {
+		if cat, ok := src.(domain.TranscriptCatalogSource); ok {
+			if meta, ok := src.(domain.TranscriptMetaSource); ok {
+				entries, err := cat.TranscriptCatalog(ctx)
+				if err != nil {
+					return IndexStats{}, fmt.Errorf("transcript catalog: %w", err)
+				}
+				for i := range entries {
+					d := discoveredTranscript{source: src, catalog: &entries[i], meta: meta}
+					if prev, ok := dMap[entries[i].ID]; ok && prev.session != nil {
+						d.session = prev.session
+					}
+					dMap[entries[i].ID] = d
+				}
+				debugf(opts.Debug, "discovered transcript source=%T catalog=%d", src, len(entries))
+				continue
+			}
+		}
 		tSessions, err := src.Sessions(ctx)
 		if err != nil {
 			return IndexStats{}, fmt.Errorf("transcript sessions: %w", err)
 		}
 		for _, sess := range tSessions {
-			if prev, ok := tMap[sess.ID]; ok {
-				sess = mergeSessionMetadata(sess, prev)
+			d := discoveredTranscript{source: src}
+			if prev, ok := dMap[sess.ID]; ok {
+				if prev.session != nil {
+					sess = mergeSessionMetadata(sess, *prev.session)
+				} else if prev.meta != nil {
+					d.meta = prev.meta
+				}
 			}
-			tMap[sess.ID] = sess
-			tSource[sess.ID] = src
+			d.session = &sess
+			dMap[sess.ID] = d
 		}
 		debugf(opts.Debug, "discovered transcript source=%T sessions=%d", src, len(tSessions))
 	}
@@ -96,17 +144,12 @@ func (s *IndexService) RunWithOptions(ctx context.Context, indexCfg config.Index
 		pMap[p.SessionID] = append(pMap[p.SessionID], p)
 	}
 
-	seen := make(map[string]bool)
 	var sessionIDs []string
-	for id := range tMap {
-		if !seen[id] {
-			seen[id] = true
-			sessionIDs = append(sessionIDs, id)
-		}
+	for id := range dMap {
+		sessionIDs = append(sessionIDs, id)
 	}
 	for id := range pMap {
-		if !seen[id] {
-			seen[id] = true
+		if _, ok := dMap[id]; !ok {
 			sessionIDs = append(sessionIDs, id)
 		}
 	}
@@ -114,83 +157,21 @@ func (s *IndexService) RunWithOptions(ctx context.Context, indexCfg config.Index
 	total := len(sessionIDs)
 	var stats IndexStats
 	stats.Sessions = total
-	debugf(opts.Debug, "index sessions total=%d transcript=%d prompt_only=%d", total, len(tMap), len(pMap))
+	debugf(opts.Debug, "index sessions total=%d transcript=%d prompt_only=%d", total, len(dMap), len(pMap))
 
+	run := &indexRun{svc: s, opts: opts, hashes: hashes, stats: &stats}
 	for i, id := range sessionIDs {
 		if progress != nil {
 			progress(i, total)
 		}
-		if sess, ok := tMap[id]; ok {
-			sessionStart := time.Now()
-			selectedSource := tSource[id]
-			skipped, fp, matchedSource := s.shouldSkipTranscript(ctx, id, selectedSource, opts)
-			if skipped {
-				stats.Skipped++
-				debugf(opts.Debug, "skip transcript id=%s path=%s elapsed=%s", id, fp.Path, time.Since(sessionStart).Round(time.Millisecond))
-				continue
-			}
-
-			var msgs []domain.Message
-			var loaded bool
-			var loadedSource domain.TranscriptSource
-			firstSource := matchedSource
-			if firstSource == nil {
-				firstSource = selectedSource
-			}
-			for _, src := range orderedTranscriptSources(s.transcripts, firstSource) {
-				var candidate []domain.Message
-				if err := src.Messages(ctx, id, func(m domain.Message) error {
-					candidate = append(candidate, m)
-					return nil
-				}); err == nil && len(candidate) > 0 {
-					msgs = candidate
-					loaded = true
-					loadedSource = src
-					break
-				} else if err != nil {
-					debugf(opts.Debug, "load transcript failed id=%s source=%T err=%v", id, src, err)
-				} else {
-					debugf(opts.Debug, "load transcript empty id=%s source=%T", id, src)
-				}
-			}
-			if !loaded {
-				debugf(opts.Debug, "skip transcript id=%s reason=no_messages elapsed=%s", id, time.Since(sessionStart).Round(time.Millisecond))
-				continue
-			}
-			sess.MessageCount = len(msgs)
-			sess.RecordKind = domain.RecordChat
-			if sess.Vendor == "" {
-				sess.Vendor = domain.VendorClaude
-			}
-			if err := s.repo.ReplaceSession(ctx, sess, msgs); err != nil {
-				debugf(opts.Debug, "replace transcript failed id=%s err=%v", id, err)
-				continue
-			}
-			if fp.Path == "" || fp.Hash == "" {
-				fp = s.transcriptFingerprint(ctx, loadedSource, id, opts.Debug)
-			}
-			if fp.Path != "" && fp.Hash != "" {
-				if err := s.repo.SetFileHash(ctx, fp.Path, sess.ID, fp.Hash); err != nil {
-					debugf(opts.Debug, "store transcript fingerprint failed id=%s path=%s err=%v", id, fp.Path, err)
-				}
-			}
-			stats.Messages += len(msgs)
-			debugf(opts.Debug, "indexed transcript id=%s messages=%d path=%s elapsed=%s", id, len(msgs), fp.Path, time.Since(sessionStart).Round(time.Millisecond))
-		} else {
-			sessionStart := time.Now()
-			prompts := pMap[id]
-			if len(prompts) == 0 {
-				continue
-			}
-			sess := synthesizeSession(id, prompts)
-			msgs := promptsToMessages(id, prompts)
-			if err := s.repo.ReplaceSession(ctx, sess, msgs); err != nil {
-				debugf(opts.Debug, "replace prompt-only failed id=%s err=%v", id, err)
-				continue
-			}
-			stats.Orphaned++
-			stats.Messages += len(msgs)
-			debugf(opts.Debug, "indexed prompt-only id=%s messages=%d elapsed=%s", id, len(msgs), time.Since(sessionStart).Round(time.Millisecond))
+		d, ok := dMap[id]
+		switch {
+		case ok && d.catalog != nil:
+			run.catalogSession(ctx, id, d)
+		case ok:
+			run.transcriptSession(ctx, id, d)
+		default:
+			run.promptOnlySession(ctx, id, pMap[id])
 		}
 	}
 
@@ -209,6 +190,152 @@ func (s *IndexService) RunWithOptions(ctx context.Context, indexCfg config.Index
 	stats.Elapsed = time.Since(start)
 	debugf(opts.Debug, "index done sessions=%d orphaned=%d plans=%d skipped=%d messages=%d elapsed=%s", stats.Sessions, stats.Orphaned, stats.Plans, stats.Skipped, stats.Messages, stats.Elapsed.Round(time.Millisecond))
 	return stats, nil
+}
+
+// transcriptSession indexes a session whose metadata came from Sessions.
+func (r *indexRun) transcriptSession(ctx context.Context, id string, d discoveredTranscript) {
+	sessionStart := time.Now()
+	sess := *d.session
+	skipped, fp, matchedSource := r.svc.shouldSkipTranscript(ctx, id, d.source, r.opts, r.hashes)
+	if skipped {
+		r.stats.Skipped++
+		debugf(r.opts.Debug, "skip transcript id=%s path=%s elapsed=%s", id, fp.Path, time.Since(sessionStart).Round(time.Millisecond))
+		return
+	}
+
+	firstSource := matchedSource
+	if firstSource == nil {
+		firstSource = d.source
+	}
+	msgs, loadedSource, loaded := r.svc.loadMessages(ctx, id, firstSource, r.opts.Debug)
+	if !loaded {
+		debugf(r.opts.Debug, "skip transcript id=%s reason=no_messages elapsed=%s", id, time.Since(sessionStart).Round(time.Millisecond))
+		return
+	}
+	if d.meta != nil {
+		if fallback, err := d.meta.SessionMeta(ctx, id); err == nil {
+			sess = mergeSessionMetadata(sess, fallback)
+		} else {
+			debugf(r.opts.Debug, "session meta fallback failed id=%s err=%v", id, err)
+		}
+	}
+	r.writeSession(ctx, id, sess, msgs, fp, loadedSource, sessionStart)
+}
+
+// catalogSession indexes a session discovered through a cheap catalog: the
+// stored hash decides the skip before any file content is parsed.
+func (r *indexRun) catalogSession(ctx context.Context, id string, d discoveredTranscript) {
+	sessionStart := time.Now()
+	fp := d.catalog.Fingerprint
+	if !r.opts.Force && fp.Path != "" && fp.Hash != "" {
+		if stored, ok := r.hashes[fp.Path]; ok && stored == fp.Hash {
+			r.stats.Skipped++
+			debugf(r.opts.Debug, "skip transcript id=%s path=%s elapsed=%s", id, fp.Path, time.Since(sessionStart).Round(time.Millisecond))
+			return
+		}
+	}
+
+	sess, err := d.meta.SessionMeta(ctx, id)
+	if err != nil {
+		debugf(r.opts.Debug, "session meta failed id=%s err=%v", id, err)
+		return
+	}
+	if d.session != nil {
+		sess = mergeSessionMetadata(sess, *d.session)
+	}
+	msgs, loadedSource, loaded := r.svc.loadMessages(ctx, id, d.source, r.opts.Debug)
+	if !loaded {
+		debugf(r.opts.Debug, "skip transcript id=%s reason=no_messages elapsed=%s", id, time.Since(sessionStart).Round(time.Millisecond))
+		return
+	}
+	r.writeSession(ctx, id, sess, msgs, fp, loadedSource, sessionStart)
+}
+
+func (r *indexRun) writeSession(ctx context.Context, id string, sess domain.Session, msgs []domain.Message, fp domain.TranscriptFingerprint, loadedSource domain.TranscriptSource, sessionStart time.Time) {
+	sess.MessageCount = len(msgs)
+	sess.RecordKind = domain.RecordChat
+	if sess.Vendor == "" {
+		sess.Vendor = domain.VendorClaude
+	}
+	if err := r.svc.repo.ReplaceSession(ctx, sess, msgs); err != nil {
+		debugf(r.opts.Debug, "replace transcript failed id=%s err=%v", id, err)
+		return
+	}
+	if fp.Path == "" || fp.Hash == "" {
+		fp = r.svc.transcriptFingerprint(ctx, loadedSource, id, r.opts.Debug)
+	}
+	if fp.Path != "" && fp.Hash != "" {
+		if err := r.svc.repo.SetFileHash(ctx, fp.Path, sess.ID, fp.Hash); err != nil {
+			debugf(r.opts.Debug, "store transcript fingerprint failed id=%s path=%s err=%v", id, fp.Path, err)
+		} else {
+			r.hashes[fp.Path] = fp.Hash
+		}
+	}
+	r.stats.Messages += len(msgs)
+	debugf(r.opts.Debug, "indexed transcript id=%s messages=%d path=%s elapsed=%s", id, len(msgs), fp.Path, time.Since(sessionStart).Round(time.Millisecond))
+}
+
+// promptOnlySession indexes prompts with no transcript. The stored digest of
+// the prompts decides the skip, so re-runs stop rewriting these sessions.
+func (r *indexRun) promptOnlySession(ctx context.Context, id string, prompts []domain.Prompt) {
+	if len(prompts) == 0 {
+		return
+	}
+	sessionStart := time.Now()
+	r.stats.Orphaned++
+
+	key := "history:" + id
+	digest := promptDigest(prompts)
+	if !r.opts.Force {
+		if stored, ok := r.hashes[key]; ok && stored == digest {
+			r.stats.Skipped++
+			debugf(r.opts.Debug, "skip prompt-only id=%s elapsed=%s", id, time.Since(sessionStart).Round(time.Millisecond))
+			return
+		}
+	}
+
+	sess := synthesizeSession(id, prompts)
+	msgs := promptsToMessages(id, prompts)
+	if err := r.svc.repo.ReplaceSession(ctx, sess, msgs); err != nil {
+		debugf(r.opts.Debug, "replace prompt-only failed id=%s err=%v", id, err)
+		return
+	}
+	r.hashes[key] = digest
+	if err := r.svc.repo.SetFileHash(ctx, key, id, digest); err != nil {
+		debugf(r.opts.Debug, "store prompt-only digest failed id=%s err=%v", id, err)
+	}
+	r.stats.Messages += len(msgs)
+	debugf(r.opts.Debug, "indexed prompt-only id=%s messages=%d elapsed=%s", id, len(msgs), time.Since(sessionStart).Round(time.Millisecond))
+}
+
+// promptDigest hashes everything that shapes a prompt-only session, so a
+// changed prompt list invalidates the skip and a stable one does not.
+func promptDigest(prompts []domain.Prompt) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "history-prompts-v1\n")
+	for _, p := range prompts {
+		fmt.Fprintf(&b, "%d\t%s\t%s\t%s\n", p.Seq, p.Timestamp.UTC().Format(time.RFC3339Nano), p.Project, p.Text)
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return "history-prompts-v1:" + hex.EncodeToString(sum[:])
+}
+
+// loadMessages streams a session from the first source that yields messages.
+func (s *IndexService) loadMessages(ctx context.Context, sessionID string, first domain.TranscriptSource, debug io.Writer) ([]domain.Message, domain.TranscriptSource, bool) {
+	for _, src := range orderedTranscriptSources(s.transcripts, first) {
+		var candidate []domain.Message
+		if err := src.Messages(ctx, sessionID, func(m domain.Message) error {
+			candidate = append(candidate, m)
+			return nil
+		}); err == nil && len(candidate) > 0 {
+			return candidate, src, true
+		} else if err != nil {
+			debugf(debug, "load transcript failed id=%s source=%T err=%v", sessionID, src, err)
+		} else {
+			debugf(debug, "load transcript empty id=%s source=%T", sessionID, src)
+		}
+	}
+	return nil, nil, false
 }
 
 func (s *IndexService) indexPlans(ctx context.Context, indexCfg config.IndexConfig, home string, opts IndexRunOptions) (IndexStats, error) {
@@ -389,7 +516,7 @@ func (s *IndexService) IndexFileWithOptions(ctx context.Context, path, title str
 	return stats, p, false, nil
 }
 
-func (s *IndexService) shouldSkipTranscript(ctx context.Context, sessionID string, preferred domain.TranscriptSource, opts IndexRunOptions) (bool, domain.TranscriptFingerprint, domain.TranscriptSource) {
+func (s *IndexService) shouldSkipTranscript(ctx context.Context, sessionID string, preferred domain.TranscriptSource, opts IndexRunOptions, hashes map[string]string) (bool, domain.TranscriptFingerprint, domain.TranscriptSource) {
 	var matchedSource domain.TranscriptSource
 	var matchedFP domain.TranscriptFingerprint
 	for _, src := range orderedTranscriptSources(s.transcripts, preferred) {
@@ -415,11 +542,7 @@ func (s *IndexService) shouldSkipTranscript(ctx context.Context, sessionID strin
 	if opts.Force || matchedFP.Path == "" {
 		return false, matchedFP, matchedSource
 	}
-	stored, ok, err := s.repo.GetFileHash(ctx, matchedFP.Path)
-	if err != nil {
-		debugf(opts.Debug, "get transcript fingerprint failed id=%s path=%s err=%v", sessionID, matchedFP.Path, err)
-		return false, matchedFP, matchedSource
-	}
+	stored, ok := hashes[matchedFP.Path]
 	return ok && stored == matchedFP.Hash, matchedFP, matchedSource
 }
 

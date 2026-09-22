@@ -19,6 +19,25 @@ type TranscriptFingerprintSource interface {
 	TranscriptFingerprint(ctx context.Context, sessionID string) (TranscriptFingerprint, error)
 }
 
+// TranscriptCatalogEntry describes a discovered transcript without parsing it.
+type TranscriptCatalogEntry struct {
+	ID          string
+	Vendor      Vendor
+	Fingerprint TranscriptFingerprint
+}
+
+// TranscriptCatalogSource lists transcripts cheaply (directory walk + stat),
+// so callers can skip unchanged sessions before reading any file content.
+type TranscriptCatalogSource interface {
+	TranscriptCatalog(ctx context.Context) ([]TranscriptCatalogEntry, error)
+}
+
+// TranscriptMetaSource resolves metadata for a single session without walking
+// the whole source. Used with TranscriptCatalogSource for changed sessions.
+type TranscriptMetaSource interface {
+	SessionMeta(ctx context.Context, sessionID string) (Session, error)
+}
+
 type PromptLog interface {
 	Prompts(ctx context.Context) ([]Prompt, error)
 }
@@ -31,6 +50,7 @@ type SearchRepository interface {
 	Init(ctx context.Context) error
 	ReplaceSession(ctx context.Context, s Session, msgs []Message) error
 	GetFileHash(ctx context.Context, path string) (hash string, ok bool, err error)
+	FileHashes(ctx context.Context) (map[string]string, error)
 	SetFileHash(ctx context.Context, path, sessionID, hash string) error
 	Search(ctx context.Context, query string, limit int, f SearchFilter) ([]SearchHit, error)
 	RecentSessions(ctx context.Context, q RecentQuery) ([]SearchHit, error)

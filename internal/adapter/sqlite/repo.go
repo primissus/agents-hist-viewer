@@ -396,6 +396,26 @@ func (r *Repo) GetFileHash(ctx context.Context, path string) (string, bool, erro
 	return hash, true, nil
 }
 
+// FileHashes returns every stored path->hash pair in one query, so index runs
+// can decide what to skip without a lookup per session.
+func (r *Repo) FileHashes(ctx context.Context) (map[string]string, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT path, content_hash FROM file_hashes`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]string)
+	for rows.Next() {
+		var path, hash string
+		if err := rows.Scan(&path, &hash); err != nil {
+			return nil, err
+		}
+		out[path] = hash
+	}
+	return out, rows.Err()
+}
+
 func (r *Repo) SetFileHash(ctx context.Context, path, sessionID, hash string) error {
 	_, err := r.db.ExecContext(ctx,
 		`INSERT INTO file_hashes(path,session_id,content_hash,updated_at)

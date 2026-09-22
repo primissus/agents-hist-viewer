@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	claudetranscript "claude-code-hist-viewer/internal/adapter/transcript"
@@ -21,6 +22,10 @@ type Source struct {
 	root       string
 	claudeRoot string
 	opts       domain.IndexOptions
+
+	mu     sync.Mutex
+	cached map[string]desktopRecord
+	loaded bool
 }
 
 type localSession struct {
@@ -99,7 +104,31 @@ func (s *Source) record(ctx context.Context, sessionID string) (desktopRecord, e
 	return rec, nil
 }
 
+// records resolves desktop sessions from disk once per source: the walk needs
+// the full transcript index and re-reading every local_*.json, and callers may
+// ask for fingerprints, messages, and metadata of many sessions in one run.
 func (s *Source) records(ctx context.Context) (map[string]desktopRecord, error) {
+	s.mu.Lock()
+	if s.loaded {
+		out := s.cached
+		s.mu.Unlock()
+		return out, nil
+	}
+	s.mu.Unlock()
+
+	out, err := s.scanRecords(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	s.cached = out
+	s.loaded = true
+	s.mu.Unlock()
+	return out, nil
+}
+
+func (s *Source) scanRecords(ctx context.Context) (map[string]desktopRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
