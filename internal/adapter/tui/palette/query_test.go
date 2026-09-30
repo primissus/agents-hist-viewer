@@ -2,8 +2,10 @@ package palette
 
 import (
 	"io"
+	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseColorSpec(t *testing.T) {
@@ -34,19 +36,33 @@ func TestBuildQuery(t *testing.T) {
 	}
 }
 
+// scriptedTTY serves a fixed response, then blocks until the read deadline
+// (like a real terminal that has finished replying) instead of returning EOF.
 type scriptedTTY struct {
-	query strings.Builder
-	resp  string
-	off   int
+	query    strings.Builder
+	resp     string
+	off      int
+	deadline time.Time
 }
 
 func (s *scriptedTTY) Write(p []byte) (int, error) {
 	return s.query.Write(p)
 }
 
+func (s *scriptedTTY) SetReadDeadline(t time.Time) error {
+	s.deadline = t
+	return nil
+}
+
 func (s *scriptedTTY) Read(p []byte) (int, error) {
 	if s.off >= len(s.resp) {
-		return 0, io.EOF
+		if s.deadline.IsZero() {
+			return 0, io.EOF
+		}
+		if d := time.Until(s.deadline); d > 0 {
+			time.Sleep(d)
+		}
+		return 0, os.ErrDeadlineExceeded
 	}
 	n := copy(p, s.resp[s.off:])
 	s.off += n
@@ -60,7 +76,8 @@ func TestQueryPalette(t *testing.T) {
 
 	tty := &scriptedTTY{
 		resp: "\x1b]4;2;rgb:9898/c3c3/7979\x1b\\" +
-			"\x1b]4;4;rgb:4585/8585/8888\x1b\\",
+			"\x1b]4;4;rgb:4585/8585/8888\x1b\\" +
+			"\x1b[1;1R",
 	}
 	got, err := QueryPalette(tty, tty, []int{2, 4})
 	if err != nil {
@@ -72,8 +89,52 @@ func TestQueryPalette(t *testing.T) {
 	if got[4] != "#458588" {
 		t.Fatalf("slot 4 = %q", got[4])
 	}
-	if tty.query.String() != buildQuery([]int{2, 4}) {
+	if tty.query.String() != buildQuery([]int{2, 4})+syncQuery {
 		t.Fatalf("unexpected query: %q", tty.query.String())
+	}
+}
+
+func TestQueryPaletteSyncFence(t *testing.T) {
+	t.Setenv("CHV_NO_COLOR_QUERY", "")
+	t.Setenv("TERM", "xterm-ghostty")
+	t.Setenv("TERM_PROGRAM", "")
+
+	tty := &scriptedTTY{resp: "\x1b[1;1R"}
+	start := time.Now()
+	got, err := QueryPalette(tty, tty, []int{0})
+	if err != ErrTimeout {
+		t.Fatalf("got %v, want ErrTimeout", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %v, want empty", got)
+	}
+	if elapsed := time.Since(start); elapsed >= queryTimeout {
+		t.Fatalf("waited %v, want immediate return on fence", elapsed)
+	}
+}
+
+func TestQueryPaletteFenceAfterPartial(t *testing.T) {
+	t.Setenv("CHV_NO_COLOR_QUERY", "")
+	t.Setenv("TERM", "xterm-ghostty")
+	t.Setenv("TERM_PROGRAM", "")
+
+	tty := &scriptedTTY{
+		resp: "\x1b]4;2;rgb:9898/c3c3/7979\x1b\\" +
+			"\x1b[1;1R",
+	}
+	start := time.Now()
+	got, err := QueryPalette(tty, tty, []int{2, 4})
+	if err != ErrTimeout {
+		t.Fatalf("got %v, want ErrTimeout", err)
+	}
+	if got[2] != "#98c379" {
+		t.Fatalf("slot 2 = %q, want partial map preserved", got[2])
+	}
+	if _, ok := got[4]; ok {
+		t.Fatalf("slot 4 = %q, want missing", got[4])
+	}
+	if elapsed := time.Since(start); elapsed >= queryTimeout {
+		t.Fatalf("waited %v, want fast return on fence", elapsed)
 	}
 }
 
