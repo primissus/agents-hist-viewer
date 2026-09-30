@@ -13,12 +13,20 @@ import (
 
 const queryTimeout = 200 * time.Millisecond
 
+// syncQuery is a cursor-position report request used as a fence: the terminal
+// replies with syncResponse only after it has finished answering the OSC 4
+// palette query.
+const syncQuery = "\x1b[6n"
+
 var (
 	ErrUnsupported = errors.New("palette query unsupported")
 	ErrTimeout     = errors.New("palette query timeout")
 )
 
-var osc4Response = regexp.MustCompile(`\x1b\]4;(\d+);([^\x07\x1b]+)`)
+var (
+	osc4Response = regexp.MustCompile(`\x1b\]4;(\d+);([^\x07\x1b]+)`)
+	syncResponse = regexp.MustCompile(`\x1b\[\d+;\d+R`)
+)
 
 // QueryPalette reads live RGB values for palette indices via OSC 4.
 // Writes queries to out and reads responses from in (typically stdout/stdin).
@@ -31,7 +39,7 @@ func QueryPalette(out io.Writer, in io.Reader, indices []int) (map[int]string, e
 	}
 
 	query := buildQuery(indices)
-	if _, err := out.Write([]byte(query)); err != nil {
+	if _, err := out.Write([]byte(query + syncQuery)); err != nil {
 		return nil, err
 	}
 
@@ -77,6 +85,15 @@ func QueryPalette(out io.Writer, in io.Reader, indices []int) (map[int]string, e
 					end += 2
 				}
 				buf = buf[end:]
+			}
+			// Fence reply has a different lead byte ([ vs ]) so the OSC 4
+			// loop leaves it at the head of buf. Seeing it means the terminal
+			// is done replying — return now instead of burning the timeout.
+			if syncResponse.Match(buf) {
+				if len(got) >= len(want) {
+					return got, nil
+				}
+				return got, ErrTimeout
 			}
 		}
 		if err != nil {
