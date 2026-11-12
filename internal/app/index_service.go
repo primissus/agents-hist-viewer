@@ -77,11 +77,12 @@ type discoveredTranscript struct {
 
 // indexRun carries per-run state shared by the session handlers.
 type indexRun struct {
-	svc    *IndexService
-	opts   IndexRunOptions
-	hashes map[string]string
-	stats  *IndexStats
-	errs   []error
+	svc     *IndexService
+	opts    IndexRunOptions
+	hashes  map[string]string
+	stats   *IndexStats
+	pending []domain.FileHash
+	errs    []error
 }
 
 func (s *IndexService) RunWithOptions(ctx context.Context, indexCfg config.IndexConfig, home string, progress func(done, total int), opts IndexRunOptions) (IndexStats, error) {
@@ -155,6 +156,11 @@ func (s *IndexService) RunWithOptions(ctx context.Context, indexCfg config.Index
 	debugf(opts.Debug, "discovered prompts=%d", len(pAll))
 	pMap := make(map[string][]domain.Prompt)
 	for _, p := range pAll {
+		// Prompts for sessions that already have a transcript are never used
+		// for indexing (the transcript wins), so skip grouping them.
+		if _, ok := dMap[p.SessionID]; ok {
+			continue
+		}
 		pMap[p.SessionID] = append(pMap[p.SessionID], p)
 	}
 
@@ -193,7 +199,13 @@ func (s *IndexService) RunWithOptions(ctx context.Context, indexCfg config.Index
 		progress(total, total)
 	}
 
-	planStats, _ := run.indexPlans(ctx, indexCfg, home)
+	planStats, planHashes, _ := run.indexPlans(ctx, indexCfg, home)
+	run.pending = append(run.pending, planHashes...)
+	if len(run.pending) > 0 {
+		if err := s.repo.SetFileHashes(ctx, run.pending); err != nil {
+			_ = run.fail("store file hashes: %w", err)
+		}
+	}
 	stats.Plans = planStats.Plans
 	stats.Skipped += planStats.Skipped
 	stats.Messages += planStats.Messages
@@ -289,20 +301,16 @@ func (r *indexRun) writeSession(ctx context.Context, id string, sess domain.Sess
 		return r.fail("replace transcript failed id=%s: %w", id, err)
 	}
 	r.stats.Indexed++
-	var hashErr error
 	if fp.Path == "" || fp.Hash == "" {
 		fp = r.svc.transcriptFingerprint(ctx, loadedSource, id, r.opts.Debug)
 	}
 	if fp.Path != "" && fp.Hash != "" {
-		if err := r.svc.repo.SetFileHash(ctx, fp.Path, sess.ID, fp.Hash); err != nil {
-			hashErr = r.fail("store transcript fingerprint failed id=%s path=%s: %w", id, fp.Path, err)
-		} else {
-			r.hashes[fp.Path] = fp.Hash
-		}
+		r.pending = append(r.pending, domain.FileHash{Path: fp.Path, SessionID: sess.ID, Hash: fp.Hash})
+		r.hashes[fp.Path] = fp.Hash
 	}
 	r.stats.Messages += len(msgs)
 	debugf(r.opts.Debug, "indexed transcript id=%s messages=%d path=%s elapsed=%s", id, len(msgs), fp.Path, time.Since(sessionStart).Round(time.Millisecond))
-	return hashErr
+	return nil
 }
 
 // promptOnlySession indexes prompts with no transcript. The stored digest of
@@ -330,14 +338,11 @@ func (r *indexRun) promptOnlySession(ctx context.Context, id string, prompts []d
 		return r.fail("replace prompt-only failed id=%s: %w", id, err)
 	}
 	r.stats.Indexed++
+	r.pending = append(r.pending, domain.FileHash{Path: key, SessionID: id, Hash: digest})
 	r.hashes[key] = digest
-	var hashErr error
-	if err := r.svc.repo.SetFileHash(ctx, key, id, digest); err != nil {
-		hashErr = r.fail("store prompt-only digest failed id=%s: %w", id, err)
-	}
 	r.stats.Messages += len(msgs)
 	debugf(r.opts.Debug, "indexed prompt-only id=%s messages=%d elapsed=%s", id, len(msgs), time.Since(sessionStart).Round(time.Millisecond))
-	return hashErr
+	return nil
 }
 
 // promptDigest hashes everything that shapes a prompt-only session, so a
@@ -396,9 +401,10 @@ func candidateSources(sources ...domain.TranscriptSource) []domain.TranscriptSou
 	return out
 }
 
-func (r *indexRun) indexPlans(ctx context.Context, indexCfg config.IndexConfig, home string) (IndexStats, error) {
+func (r *indexRun) indexPlans(ctx context.Context, indexCfg config.IndexConfig, home string) (IndexStats, []domain.FileHash, error) {
 	s := r.svc
 	var stats IndexStats
+	var hashes []domain.FileHash
 
 	sources := s.plans
 	if len(sources) == 0 {
@@ -408,12 +414,12 @@ func (r *indexRun) indexPlans(ctx context.Context, indexCfg config.IndexConfig, 
 	for _, src := range sources {
 		paths, err := src.PlanPaths(ctx)
 		if err != nil {
-			return stats, r.fail("plan paths: %w", err)
+			return stats, hashes, r.fail("plan paths: %w", err)
 		}
 		debugf(r.opts.Debug, "discovered plan source=%T paths=%d", src, len(paths))
 		for _, path := range paths {
 			planStart := time.Now()
-			p, skipped, err := s.indexPlanPath(ctx, path, "", r.opts.Force, domain.VendorClaude)
+			p, skipped, hash, err := s.indexPlanPath(ctx, path, "", r.opts.Force, domain.VendorClaude, r.hashes)
 			if err != nil {
 				_ = r.fail("index plan failed path=%s: %w", path, err)
 				continue
@@ -423,6 +429,7 @@ func (r *indexRun) indexPlans(ctx context.Context, indexCfg config.IndexConfig, 
 				debugf(r.opts.Debug, "skip plan id=%s path=%s elapsed=%s", p.ID, path, time.Since(planStart).Round(time.Millisecond))
 				continue
 			}
+			hashes = append(hashes, hash)
 			stats.Plans++
 			stats.Indexed++
 			stats.Messages++
@@ -433,12 +440,12 @@ func (r *indexRun) indexPlans(ctx context.Context, indexCfg config.IndexConfig, 
 	cursorSrc := cursorplan.NewSource(home)
 	cursorPaths, err := cursorSrc.PlanPaths(ctx)
 	if err != nil {
-		return stats, r.fail("cursor plan paths: %w", err)
+		return stats, hashes, r.fail("cursor plan paths: %w", err)
 	}
 	debugf(r.opts.Debug, "discovered cursor plans paths=%d", len(cursorPaths))
 	for _, path := range cursorPaths {
 		planStart := time.Now()
-		p, skipped, err := s.indexCursorPlanPath(ctx, path, r.opts.Force)
+		p, skipped, hash, err := s.indexCursorPlanPath(ctx, path, r.opts.Force, r.hashes)
 		if err != nil {
 			_ = r.fail("index cursor plan failed path=%s: %w", path, err)
 			continue
@@ -448,100 +455,87 @@ func (r *indexRun) indexPlans(ctx context.Context, indexCfg config.IndexConfig, 
 			debugf(r.opts.Debug, "skip cursor plan id=%s path=%s elapsed=%s", p.ID, path, time.Since(planStart).Round(time.Millisecond))
 			continue
 		}
+		hashes = append(hashes, hash)
 		stats.Plans++
 		stats.Indexed++
 		stats.Messages++
 		debugf(r.opts.Debug, "indexed cursor plan id=%s path=%s elapsed=%s", p.ID, path, time.Since(planStart).Round(time.Millisecond))
 	}
 
-	return stats, nil
+	return stats, hashes, nil
 }
 
-func (s *IndexService) indexPlanPath(ctx context.Context, absPath, titleOverride string, force bool, vendor domain.Vendor) (domain.Plan, bool, error) {
+func (s *IndexService) indexPlanPath(ctx context.Context, absPath, titleOverride string, force bool, vendor domain.Vendor, hashes map[string]string) (domain.Plan, bool, domain.FileHash, error) {
 	absPath, err := filepath.Abs(absPath)
 	if err != nil {
-		return domain.Plan{}, false, err
+		return domain.Plan{}, false, domain.FileHash{}, err
 	}
 
 	data, err := os.ReadFile(absPath)
 	if err != nil {
-		return domain.Plan{}, false, err
+		return domain.Plan{}, false, domain.FileHash{}, err
 	}
 	hash := plan.ContentHash(data)
 
 	if !force {
-		stored, ok, err := s.repo.GetFileHash(ctx, absPath)
-		if err != nil {
-			return domain.Plan{}, false, err
-		}
-		if ok && stored == hash {
+		if stored, ok := hashes[absPath]; ok && stored == hash {
 			p := domain.Plan{
 				ID:     plan.PlanID(absPath),
 				Title:  plan.TitleForContent(string(data), titleOverride, filepath.Base(absPath)),
 				Vendor: vendor,
 			}
-			return p, true, nil
+			return p, true, domain.FileHash{}, nil
 		}
 	}
 
-	p, err := plan.FromFile(absPath, titleOverride, config.ManualFilesDir())
+	p, err := plan.FromData(absPath, data, titleOverride, config.ManualFilesDir())
 	if err != nil {
-		return domain.Plan{}, false, err
+		return domain.Plan{}, false, domain.FileHash{}, err
 	}
 	p.Vendor = vendor
 
 	sess := planToSession(p)
 	msgs := planToMessages(p)
 	if err := s.repo.ReplaceSession(ctx, sess, msgs); err != nil {
-		return domain.Plan{}, false, err
+		return domain.Plan{}, false, domain.FileHash{}, err
 	}
-	if err := s.repo.SetFileHash(ctx, absPath, p.ID, hash); err != nil {
-		return domain.Plan{}, false, err
-	}
-	return p, false, nil
+	return p, false, domain.FileHash{Path: absPath, SessionID: p.ID, Hash: hash}, nil
 }
 
-func (s *IndexService) indexCursorPlanPath(ctx context.Context, absPath string, force bool) (domain.Plan, bool, error) {
+func (s *IndexService) indexCursorPlanPath(ctx context.Context, absPath string, force bool, hashes map[string]string) (domain.Plan, bool, domain.FileHash, error) {
 	absPath, err := filepath.Abs(absPath)
 	if err != nil {
-		return domain.Plan{}, false, err
+		return domain.Plan{}, false, domain.FileHash{}, err
 	}
 
 	data, err := os.ReadFile(absPath)
 	if err != nil {
-		return domain.Plan{}, false, err
+		return domain.Plan{}, false, domain.FileHash{}, err
 	}
 	hash := plan.ContentHash(data)
 
 	if !force {
-		stored, ok, err := s.repo.GetFileHash(ctx, absPath)
-		if err != nil {
-			return domain.Plan{}, false, err
-		}
-		if ok && stored == hash {
+		if stored, ok := hashes[absPath]; ok && stored == hash {
 			p := domain.Plan{
 				ID:     cursorplan.PlanID(absPath),
 				Title:  cursorplan.TitleForContent(string(data), "", filepath.Base(absPath)),
 				Vendor: domain.VendorCursor,
 			}
-			return p, true, nil
+			return p, true, domain.FileHash{}, nil
 		}
 	}
 
-	p, err := cursorplan.FromFile(absPath, "", cursorplan.DefaultArchiveDir())
+	p, err := cursorplan.FromData(absPath, data, "", cursorplan.DefaultArchiveDir())
 	if err != nil {
-		return domain.Plan{}, false, err
+		return domain.Plan{}, false, domain.FileHash{}, err
 	}
 
 	sess := planToSession(p)
 	msgs := planToMessages(p)
 	if err := s.repo.ReplaceSession(ctx, sess, msgs); err != nil {
-		return domain.Plan{}, false, err
+		return domain.Plan{}, false, domain.FileHash{}, err
 	}
-	if err := s.repo.SetFileHash(ctx, absPath, p.ID, hash); err != nil {
-		return domain.Plan{}, false, err
-	}
-	return p, false, nil
+	return p, false, domain.FileHash{Path: absPath, SessionID: p.ID, Hash: hash}, nil
 }
 
 func (s *IndexService) IndexFile(ctx context.Context, path, title string, force bool) (IndexStats, domain.Plan, bool, error) {
@@ -555,10 +549,19 @@ func (s *IndexService) IndexFileWithOptions(ctx context.Context, path, title str
 	if err := s.repo.Init(ctx); err != nil {
 		return IndexStats{}, domain.Plan{}, false, fmt.Errorf("init: %w", err)
 	}
+	hashes, err := s.repo.FileHashes(ctx)
+	if err != nil {
+		return IndexStats{}, domain.Plan{}, false, fmt.Errorf("file hashes: %w", err)
+	}
 
-	p, skipped, err := s.indexPlanPath(ctx, path, title, opts.Force, domain.VendorClaude)
+	p, skipped, hash, err := s.indexPlanPath(ctx, path, title, opts.Force, domain.VendorClaude, hashes)
 	if err != nil {
 		return IndexStats{}, domain.Plan{}, false, err
+	}
+	if !skipped && hash.Path != "" {
+		if err := s.repo.SetFileHash(ctx, hash.Path, hash.SessionID, hash.Hash); err != nil {
+			return IndexStats{}, domain.Plan{}, false, fmt.Errorf("store file hash: %w", err)
+		}
 	}
 
 	stats := IndexStats{Elapsed: time.Since(start)}
@@ -569,6 +572,7 @@ func (s *IndexService) IndexFileWithOptions(ctx context.Context, path, title str
 	}
 
 	stats = IndexStats{
+		Indexed:  1,
 		Plans:    1,
 		Messages: 1,
 		Elapsed:  time.Since(start),

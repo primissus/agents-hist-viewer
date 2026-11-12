@@ -1,6 +1,7 @@
 package plan
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -57,43 +58,55 @@ func FromFile(path, titleOverride, archiveDir string) (domain.Plan, error) {
 	if err != nil {
 		return domain.Plan{}, fmt.Errorf("abs path: %w", err)
 	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return domain.Plan{}, fmt.Errorf("stat: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return domain.Plan{}, fmt.Errorf("not a regular file: %s", abs)
-	}
-
 	data, err := os.ReadFile(abs)
 	if err != nil {
 		return domain.Plan{}, fmt.Errorf("read: %w", err)
 	}
+	return FromData(abs, data, titleOverride, archiveDir)
+}
 
-	id := PlanID(abs)
-	if err := os.MkdirAll(archiveDir, 0755); err != nil {
-		return domain.Plan{}, fmt.Errorf("mkdir archive: %w", err)
+// FromData builds a Plan from already-read content, archiving it without
+// re-reading the archive. Callers that hash the file first avoid a second read.
+func FromData(absPath string, data []byte, titleOverride, archiveDir string) (domain.Plan, error) {
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return domain.Plan{}, fmt.Errorf("stat: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return domain.Plan{}, fmt.Errorf("not a regular file: %s", absPath)
+	}
+
+	id := PlanID(absPath)
+	if err := writeArchive(archiveDir, id, data); err != nil {
+		return domain.Plan{}, err
 	}
 	archivePath := filepath.Join(archiveDir, archiveFilename(id))
-	if err := os.WriteFile(archivePath, data, 0644); err != nil {
-		return domain.Plan{}, fmt.Errorf("write archive: %w", err)
-	}
-
-	archived, err := os.ReadFile(archivePath)
-	if err != nil {
-		return domain.Plan{}, fmt.Errorf("read archive: %w", err)
-	}
-	content := string(archived)
 
 	return domain.Plan{
 		ID:          id,
-		Title:       titleForCursorPlan(content, titleOverride, filepath.Base(abs)),
-		ProjectPath: filepath.Dir(abs),
+		Title:       titleForCursorPlan(string(data), titleOverride, filepath.Base(absPath)),
+		ProjectPath: filepath.Dir(absPath),
 		FilePath:    archivePath,
-		Content:     content,
+		Content:     string(data),
 		ModTime:     info.ModTime().UTC(),
 		Vendor:      domain.VendorCursor,
 	}, nil
+}
+
+// writeArchive stores data under archiveDir, skipping the write when the
+// existing archive already has identical bytes.
+func writeArchive(archiveDir, id string, data []byte) error {
+	archivePath := filepath.Join(archiveDir, archiveFilename(id))
+	if existing, err := os.ReadFile(archivePath); err == nil && bytes.Equal(existing, data) {
+		return nil
+	}
+	if err := os.MkdirAll(archiveDir, 0755); err != nil {
+		return fmt.Errorf("mkdir archive: %w", err)
+	}
+	if err := os.WriteFile(archivePath, data, 0644); err != nil {
+		return fmt.Errorf("write archive: %w", err)
+	}
+	return nil
 }
 
 func archiveFilename(id string) string {

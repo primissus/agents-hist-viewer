@@ -46,12 +46,20 @@ type PlanSource interface {
 	PlanPaths(ctx context.Context) ([]string, error)
 }
 
+// FileHash is one path -> content hash record to persist.
+type FileHash struct {
+	Path      string
+	SessionID string
+	Hash      string
+}
+
 type SearchRepository interface {
 	Init(ctx context.Context) error
 	ReplaceSession(ctx context.Context, s Session, msgs []Message) error
 	GetFileHash(ctx context.Context, path string) (hash string, ok bool, err error)
 	FileHashes(ctx context.Context) (map[string]string, error)
 	SetFileHash(ctx context.Context, path, sessionID, hash string) error
+	SetFileHashes(ctx context.Context, entries []FileHash) error
 	Search(ctx context.Context, query string, limit int, f SearchFilter) ([]SearchHit, error)
 	RecentSessions(ctx context.Context, q RecentQuery) ([]SearchHit, error)
 	SessionByID(ctx context.Context, id string) (SessionDetail, error)

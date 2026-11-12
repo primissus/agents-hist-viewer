@@ -695,6 +695,159 @@ func TestRunReturnsErrorOnReplaceFailure(t *testing.T) {
 	}
 }
 
+type hashSpyRepo struct {
+	domain.SearchRepository
+	batchCalls   int
+	batchEntries int
+}
+
+func (h *hashSpyRepo) SetFileHashes(ctx context.Context, entries []domain.FileHash) error {
+	h.batchCalls++
+	h.batchEntries += len(entries)
+	return h.SearchRepository.SetFileHashes(ctx, entries)
+}
+
+func TestSingleBatchHashFlush(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+	ts := time.Now().UTC()
+	fp := domain.TranscriptFingerprint{Path: filepath.Join(home, "batch.jsonl"), Hash: "batch-hash"}
+
+	src := &fakeTranscriptSource{
+		sessions: []domain.Session{{
+			ID: "sess-batch", Title: "Batch", HasTranscript: true,
+			FilePath: fp.Path, StartedAt: ts, EndedAt: ts,
+		}},
+		msgs: map[string][]domain.Message{
+			"sess-batch": {{
+				UUID: "m1", SessionID: "sess-batch",
+				Role: domain.RoleUser, Kind: domain.KindText,
+				Text: "batch flush phrase", Source: domain.SourceTranscript,
+				Timestamp: ts, Sequence: 0,
+			}},
+		},
+		fingerprints: map[string]domain.TranscriptFingerprint{"sess-batch": fp},
+		messageCalls: map[string]int{},
+	}
+	planFile := filepath.Join(home, "PLAN.md")
+	if err := os.WriteFile(planFile, []byte("# Batch Plan\nbatch plan phrase"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	plans := &fakePlanSource{paths: []string{planFile}}
+
+	spy := &hashSpyRepo{SearchRepository: openRepo(t)}
+	svc := app.NewIndexService(src, &fakePromptLog{}, plans, spy, domain.DefaultShrinkConfig)
+
+	stats1, err := svc.Run(ctx, config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats1.Indexed != 2 {
+		t.Fatalf("expected transcript + plan indexed, got %+v", stats1)
+	}
+	if spy.batchCalls != 1 || spy.batchEntries != 2 {
+		t.Fatalf("expected one batch flush with 2 entries, got calls=%d entries=%d", spy.batchCalls, spy.batchEntries)
+	}
+
+	stats2, err := svc.Run(ctx, config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats2.Skipped != 2 || stats2.Indexed != 0 {
+		t.Fatalf("expected second run to skip all, got %+v", stats2)
+	}
+	if spy.batchCalls != 1 {
+		t.Fatalf("expected no flush on all-skip run, got %d calls", spy.batchCalls)
+	}
+}
+
+type noGetHashRepo struct {
+	domain.SearchRepository
+	getCalls int
+}
+
+func (n *noGetHashRepo) GetFileHash(context.Context, string) (string, bool, error) {
+	n.getCalls++
+	return "", false, errors.New("unexpected per-plan hash lookup")
+}
+
+func TestPlanIndexUsesHashMap(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+
+	planFile := filepath.Join(home, "PLAN.md")
+	if err := os.WriteFile(planFile, []byte("# HashMap Plan\nplan hash map phrase"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	spy := &noGetHashRepo{SearchRepository: openRepo(t)}
+	svc := app.NewIndexService(&fakeTranscriptSource{}, &fakePromptLog{}, &fakePlanSource{paths: []string{planFile}}, spy, domain.DefaultShrinkConfig)
+
+	stats1, err := svc.Run(ctx, config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats1.Plans != 1 {
+		t.Fatalf("expected plan indexed, got %+v", stats1)
+	}
+	stats2, err := svc.Run(ctx, config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats2.Skipped != 1 || stats2.Plans != 0 {
+		t.Fatalf("expected hash-map skip on second run, got %+v", stats2)
+	}
+	if spy.getCalls != 0 {
+		t.Fatalf("expected plan indexing to use the loaded hash map, got %d GetFileHash calls", spy.getCalls)
+	}
+}
+
+func TestLoadMessagesDoesNotProbeUnrelatedSources(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	ts := time.Now().UTC()
+
+	src := &fakeTranscriptSource{
+		sessions: []domain.Session{{
+			ID: "sess-solo", Title: "Solo", HasTranscript: true,
+			StartedAt: ts, EndedAt: ts,
+		}},
+		msgs: map[string][]domain.Message{
+			"sess-solo": {{
+				UUID: "solo-m1", SessionID: "sess-solo",
+				Role: domain.RoleUser, Kind: domain.KindText,
+				Text: "solo source phrase", Source: domain.SourceTranscript,
+				Timestamp: ts, Sequence: 0,
+			}},
+		},
+		messageCalls: map[string]int{},
+	}
+	unrelated := &fakeTranscriptSource{
+		msgs:         map[string][]domain.Message{},
+		messageCalls: map[string]int{},
+	}
+
+	repo := openRepo(t)
+	svc := app.NewIndexServiceMulti(
+		[]domain.TranscriptSource{src, unrelated},
+		&fakePromptLog{},
+		nil,
+		repo,
+		domain.DefaultShrinkConfig,
+	)
+	if _, err := svc.Run(ctx, config.IndexConfig{}, home, nil); err != nil {
+		t.Fatal(err)
+	}
+	if src.messageCalls["sess-solo"] != 1 {
+		t.Fatalf("owning source message loads = %d, want 1", src.messageCalls["sess-solo"])
+	}
+	if unrelated.messageCalls["sess-solo"] != 0 {
+		t.Fatalf("unrelated source should not be probed, got %d loads", unrelated.messageCalls["sess-solo"])
+	}
+}
+
 func TestCatalogSourceSkipOnRun(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()

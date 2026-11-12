@@ -14,7 +14,10 @@ import (
 
 var _ domain.SearchRepository = (*Repo)(nil)
 
-type Repo struct{ db *sql.DB }
+type Repo struct {
+	db              *sql.DB
+	embeddingsExist bool
+}
 
 func Open(path string) (*Repo, error) {
 	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(wal)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
@@ -33,15 +36,28 @@ func (r *Repo) Init(ctx context.Context) error {
 	if _, err := r.db.ExecContext(ctx, ddl); err != nil {
 		return err
 	}
-	// Migration: add columns to existing DBs (ignore error if already present).
+	// Migration: add columns to existing DBs and backfill only when the column
+	// was actually missing, so a normal run does not rewrite every session.
 	r.db.ExecContext(ctx, `ALTER TABLE messages ADD COLUMN text TEXT NOT NULL DEFAULT ''`)
-	r.db.ExecContext(ctx, `ALTER TABLE sessions ADD COLUMN record_kind TEXT NOT NULL DEFAULT 'chat'`)
-	r.db.ExecContext(ctx, `UPDATE sessions SET record_kind='plan' WHERE id LIKE 'plan:%' OR id LIKE 'cursor-plan:%'`)
-	r.db.ExecContext(ctx, `ALTER TABLE sessions ADD COLUMN vendor TEXT NOT NULL DEFAULT 'claude'`)
-	r.db.ExecContext(ctx, `UPDATE sessions SET vendor='cursor' WHERE id LIKE 'cursor:%' OR id LIKE 'cursor-plan:%'`)
+	if _, err := r.db.ExecContext(ctx, `ALTER TABLE sessions ADD COLUMN record_kind TEXT NOT NULL DEFAULT 'chat'`); err == nil {
+		if _, err := r.db.ExecContext(ctx, `UPDATE sessions SET record_kind='plan' WHERE id LIKE 'plan:%' OR id LIKE 'cursor-plan:%'`); err != nil {
+			return err
+		}
+	}
+	if _, err := r.db.ExecContext(ctx, `ALTER TABLE sessions ADD COLUMN vendor TEXT NOT NULL DEFAULT 'claude'`); err == nil {
+		if _, err := r.db.ExecContext(ctx, `UPDATE sessions SET vendor='cursor' WHERE id LIKE 'cursor:%' OR id LIKE 'cursor-plan:%'`); err != nil {
+			return err
+		}
+	}
 	if _, err := r.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_sessions_filters ON sessions(vendor, record_kind, project_path)`); err != nil {
 		return err
 	}
+
+	var exists int
+	if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name='embeddings'`).Scan(&exists); err != nil {
+		return err
+	}
+	r.embeddingsExist = exists > 0
 	return nil
 }
 
@@ -62,9 +78,12 @@ func (r *Repo) ReplaceSession(ctx context.Context, s domain.Session, msgs []doma
 		return err
 	}
 
-	preserved, err := preservedEmbeddings(ctx, tx, s.ID)
-	if err != nil {
-		return err
+	preserved := map[int][]preservedEmbedding(nil)
+	if r.embeddingsExist {
+		preserved, err = preservedEmbeddings(ctx, tx, s.ID)
+		if err != nil {
+			return err
+		}
 	}
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE session_id = ?`, s.ID); err != nil {
@@ -148,14 +167,6 @@ type preservedEmbedding struct {
 // matching on (seq, text_hash) so unchanged blocks keep their vectors across
 // a re-index and only genuinely changed ones need re-embedding.
 func preservedEmbeddings(ctx context.Context, tx *sql.Tx, sessionID string) (map[int][]preservedEmbedding, error) {
-	var exists int
-	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name='embeddings'`).Scan(&exists); err != nil {
-		return nil, err
-	}
-	if exists == 0 {
-		return nil, nil
-	}
-
 	rows, err := tx.QueryContext(ctx,
 		`SELECT m.seq, e.model, e.dim, e.vector, e.text_hash, e.created_at
 		 FROM embeddings e JOIN messages m ON m.rowid = e.message_rowid
@@ -417,16 +428,40 @@ func (r *Repo) FileHashes(ctx context.Context) (map[string]string, error) {
 }
 
 func (r *Repo) SetFileHash(ctx context.Context, path, sessionID, hash string) error {
-	_, err := r.db.ExecContext(ctx,
+	return r.SetFileHashes(ctx, []domain.FileHash{{Path: path, SessionID: sessionID, Hash: hash}})
+}
+
+// SetFileHashes writes every path->hash pair in one transaction, so an index
+// run does not pay one implicit transaction per changed session/plan.
+func (r *Repo) SetFileHashes(ctx context.Context, entries []domain.FileHash) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx,
 		`INSERT INTO file_hashes(path,session_id,content_hash,updated_at)
 		 VALUES(?,?,?,?)
 		 ON CONFLICT(path) DO UPDATE SET
 		   session_id=excluded.session_id,
 		   content_hash=excluded.content_hash,
-		   updated_at=excluded.updated_at`,
-		path, sessionID, hash, time.Now().UTC().Format(time.RFC3339Nano),
-	)
-	return err
+		   updated_at=excluded.updated_at`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, e := range entries {
+		if _, err := stmt.ExecContext(ctx, e.Path, e.SessionID, e.Hash, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func nullStr(s string) interface{} {

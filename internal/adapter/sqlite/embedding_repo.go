@@ -37,8 +37,11 @@ CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model);
 const embeddableWhere = `((m.kind = 'text' AND m.role IN ('user','assistant')) OR (m.kind = 'tool_use' AND m.tool_name = 'Bash'))`
 
 func (r *Repo) InitEmbeddings(ctx context.Context) error {
-	_, err := r.db.ExecContext(ctx, embeddingsDDL)
-	return err
+	if _, err := r.db.ExecContext(ctx, embeddingsDDL); err != nil {
+		return err
+	}
+	r.embeddingsExist = true
+	return nil
 }
 
 func (r *Repo) UnembeddedUnits(ctx context.Context, model string, f domain.EmbedFilter, limit int) ([]domain.EmbedUnit, error) {

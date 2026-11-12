@@ -558,6 +558,135 @@ CREATE TABLE file_hashes (
 	}
 }
 
+func TestInitBackfillOnlyOnce(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyDDL := `
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    project_path TEXT NOT NULL DEFAULT '',
+    git_branch TEXT NOT NULL DEFAULT '',
+    started_at TEXT,
+    ended_at TEXT,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    file_path TEXT NOT NULL DEFAULT '',
+    has_transcript INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE messages (
+    rowid INTEGER PRIMARY KEY,
+    uuid TEXT NOT NULL,
+    parent_uuid TEXT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    tool_name TEXT,
+    source TEXT NOT NULL DEFAULT 'transcript',
+    timestamp TEXT,
+    seq INTEGER NOT NULL,
+    is_sidechain INTEGER NOT NULL DEFAULT 0,
+    text TEXT NOT NULL DEFAULT ''
+);
+CREATE VIRTUAL TABLE messages_fts USING fts5(text);
+CREATE TABLE file_hashes (
+    path TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);`
+	if _, err := db.ExecContext(ctx, legacyDDL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO sessions(id,title,started_at,ended_at) VALUES('plan:legacy','legacy plan','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	r, err := sqlite.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close() })
+	if err := r.Init(ctx); err != nil {
+		t.Fatalf("init legacy db: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { raw.Close() })
+
+	var kind, vendor string
+	if err := raw.QueryRowContext(ctx, `SELECT record_kind, vendor FROM sessions WHERE id='plan:legacy'`).Scan(&kind, &vendor); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "plan" {
+		t.Fatalf("record_kind after first init = %q, want plan", kind)
+	}
+	if vendor != "claude" {
+		t.Fatalf("vendor after first init = %q, want claude", vendor)
+	}
+
+	// Simulate a corrected row: a second Init must not clobber it.
+	if _, err := raw.ExecContext(ctx, `UPDATE sessions SET record_kind='chat' WHERE id='plan:legacy'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Init(ctx); err != nil {
+		t.Fatalf("second init: %v", err)
+	}
+	if err := raw.QueryRowContext(ctx, `SELECT record_kind FROM sessions WHERE id='plan:legacy'`).Scan(&kind); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "chat" {
+		t.Fatalf("record_kind after second init = %q, want chat (no unconditional backfill)", kind)
+	}
+}
+
+func TestSetFileHashesBatch(t *testing.T) {
+	r := openTemp(t)
+	ctx := context.Background()
+
+	entries := []domain.FileHash{
+		{Path: "/tmp/a.jsonl", SessionID: "a", Hash: "h1"},
+		{Path: "/tmp/b.jsonl", SessionID: "b", Hash: "h2"},
+		{Path: "/tmp/c.jsonl", SessionID: "c", Hash: "h3"},
+	}
+	if err := r.SetFileHashes(ctx, entries); err != nil {
+		t.Fatalf("set batch: %v", err)
+	}
+	for _, e := range entries {
+		got, ok, err := r.GetFileHash(ctx, e.Path)
+		if err != nil || !ok || got != e.Hash {
+			t.Fatalf("%s: got %q ok=%v err=%v", e.Path, got, ok, err)
+		}
+	}
+
+	if err := r.SetFileHashes(ctx, []domain.FileHash{
+		{Path: "/tmp/a.jsonl", SessionID: "a", Hash: "updated"},
+		{Path: "/tmp/d.jsonl", SessionID: "d", Hash: "h4"},
+	}); err != nil {
+		t.Fatalf("set batch update: %v", err)
+	}
+	got, ok, err := r.GetFileHash(ctx, "/tmp/a.jsonl")
+	if err != nil || !ok || got != "updated" {
+		t.Fatalf("a after update: got %q ok=%v err=%v", got, ok, err)
+	}
+	got, ok, err = r.GetFileHash(ctx, "/tmp/d.jsonl")
+	if err != nil || !ok || got != "h4" {
+		t.Fatalf("d after insert: got %q ok=%v err=%v", got, ok, err)
+	}
+	got, ok, err = r.GetFileHash(ctx, "/tmp/b.jsonl")
+	if err != nil || !ok || got != "h2" {
+		t.Fatalf("b should be untouched: got %q ok=%v err=%v", got, ok, err)
+	}
+}
+
 func TestVendorPersistedAndFiltered(t *testing.T) {
 	r := openTemp(t)
 	ctx := context.Background()
