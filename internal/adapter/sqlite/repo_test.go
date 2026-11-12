@@ -400,6 +400,56 @@ func TestReplaceSessionIdempotent(t *testing.T) {
 	}
 }
 
+func TestReplaceSessionBulkFTS(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "fts.db")
+	r, err := sqlite.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close() })
+	ctx := context.Background()
+	if err := r.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { raw.Close() })
+
+	s := makeSession("s-fts", "bulk fts")
+	terms := []string{"alphaterm", "betaterm", "gammaterm", "deltaterm"}
+	msgs := make([]domain.Message, len(terms))
+	for i, term := range terms {
+		msgs[i] = makeMsg("s-fts", "m-"+term, i, "message "+term+" content")
+	}
+	if err := r.ReplaceSession(ctx, s, msgs); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+
+	for _, term := range terms {
+		hits, err := r.Search(ctx, term, 10, domain.SearchFilter{})
+		if err != nil {
+			t.Fatalf("search %s: %v", term, err)
+		}
+		if len(hits) != 1 || hits[0].SessionID != "s-fts" {
+			t.Fatalf("term %s not searchable, hits=%+v", term, hits)
+		}
+	}
+
+	var msgCount, ftsCount int
+	if err := raw.QueryRowContext(ctx, `SELECT count(*) FROM messages WHERE session_id = 's-fts'`).Scan(&msgCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.QueryRowContext(ctx, `SELECT count(*) FROM messages_fts WHERE rowid IN (SELECT rowid FROM messages WHERE session_id = 's-fts')`).Scan(&ftsCount); err != nil {
+		t.Fatal(err)
+	}
+	if msgCount != len(msgs) || ftsCount != msgCount {
+		t.Fatalf("messages=%d fts=%d, want %d each", msgCount, ftsCount, len(msgs))
+	}
+}
+
 func TestRecordKindPersisted(t *testing.T) {
 	r := openTemp(t)
 	ctx := context.Background()

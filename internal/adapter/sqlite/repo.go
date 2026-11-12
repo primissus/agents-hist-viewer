@@ -93,20 +93,44 @@ func (r *Repo) ReplaceSession(ctx context.Context, s domain.Session, msgs []doma
 		return err
 	}
 
+	sessStmt, err := tx.PrepareContext(ctx,
+		`INSERT INTO sessions(id,title,project_path,git_branch,started_at,ended_at,message_count,file_path,has_transcript,record_kind,vendor)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer sessStmt.Close()
+
 	hasTranscript := 0
 	if s.HasTranscript {
 		hasTranscript = 1
 	}
-	_, err = tx.ExecContext(ctx,
-		`INSERT INTO sessions(id,title,project_path,git_branch,started_at,ended_at,message_count,file_path,has_transcript,record_kind,vendor)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+	if _, err := sessStmt.ExecContext(ctx,
 		s.ID, s.Title, s.ProjectPath, s.GitBranch,
 		s.StartedAt.UTC().Format(time.RFC3339Nano),
 		s.EndedAt.UTC().Format(time.RFC3339Nano),
 		s.MessageCount, s.FilePath, hasTranscript, recordKind(s.RecordKind), vendor(s.Vendor),
-	)
+	); err != nil {
+		return err
+	}
+
+	msgStmt, err := tx.PrepareContext(ctx,
+		`INSERT INTO messages(uuid,parent_uuid,session_id,role,kind,tool_name,source,timestamp,seq,is_sidechain,text)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
+	}
+	defer msgStmt.Close()
+
+	var embedStmt *sql.Stmt
+	if len(preserved) > 0 {
+		embedStmt, err = tx.PrepareContext(ctx,
+			`INSERT INTO embeddings(message_rowid, model, dim, vector, text_hash, created_at)
+			 VALUES(?,?,?,?,?,?)`)
+		if err != nil {
+			return err
+		}
+		defer embedStmt.Close()
 	}
 
 	for _, m := range msgs {
@@ -114,9 +138,7 @@ func (r *Repo) ReplaceSession(ctx context.Context, s domain.Session, msgs []doma
 		if m.IsSidechain {
 			isSidechain = 1
 		}
-		res, err := tx.ExecContext(ctx,
-			`INSERT INTO messages(uuid,parent_uuid,session_id,role,kind,tool_name,source,timestamp,seq,is_sidechain,text)
-			 VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		res, err := msgStmt.ExecContext(ctx,
 			m.UUID, nullStr(m.ParentUUID), m.SessionID,
 			string(m.Role), string(m.Kind), nullStr(m.ToolName),
 			string(m.Source),
@@ -130,24 +152,28 @@ func (r *Repo) ReplaceSession(ctx context.Context, s domain.Session, msgs []doma
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO messages_fts(rowid,text) VALUES(?,?)`, rowid, m.Text); err != nil {
-			return fmt.Errorf("insert fts %d: %w", rowid, err)
-		}
 		if matches, ok := preserved[m.Sequence]; ok {
 			hash := textHash(m.Text)
 			for _, pe := range matches {
 				if pe.textHash != hash {
 					continue
 				}
-				if _, err := tx.ExecContext(ctx,
-					`INSERT INTO embeddings(message_rowid, model, dim, vector, text_hash, created_at)
-					 VALUES(?,?,?,?,?,?)`,
+				if _, err := embedStmt.ExecContext(ctx,
 					rowid, pe.model, pe.dim, pe.vector, pe.textHash, pe.createdAt,
 				); err != nil {
 					return fmt.Errorf("reattach embedding %d: %w", rowid, err)
 				}
 			}
 		}
+	}
+
+	// One bulk insert replaces the per-message FTS statements. messages_fts is
+	// a standalone FTS5 table, so the explicit rowid links each row.
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO messages_fts(rowid, text)
+		 SELECT rowid, text FROM messages WHERE session_id = ?`, s.ID,
+	); err != nil {
+		return fmt.Errorf("insert fts: %w", err)
 	}
 
 	return tx.Commit()
