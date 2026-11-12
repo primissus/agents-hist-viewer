@@ -144,6 +144,56 @@ func TestTranscriptCatalogMatchesFingerprintAndMeta(t *testing.T) {
 	}
 }
 
+func TestLoadSessionMatchesLoadFile(t *testing.T) {
+	root := t.TempDir()
+	proj := filepath.Join(root, "Users-user1-src-demo")
+	if err := os.MkdirAll(filepath.Join(proj, "agent-transcripts", "chat-load", "subagents"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	jsonl := filepath.Join(proj, "agent-transcripts", "chat-load", "chat-load.jsonl")
+	content := `{"role":"user","message":{"content":[{"type":"text","text":"hello cursor load session"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"reply here"}]}}`
+	if err := os.WriteFile(jsonl, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sidechain := filepath.Join(proj, "agent-transcripts", "chat-load", "subagents", "agent.jsonl")
+	if err := os.WriteFile(sidechain, []byte(`{"role":"assistant","message":{"content":[{"type":"text","text":"side reply"}]}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	src := transcript.NewSource(root, domain.DefaultIndexOptions)
+	detail, err := transcript.LoadFile(t.Context(), jsonl, domain.DefaultIndexOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, msgs, err := src.LoadSession(t.Context(), "cursor:chat-load")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if sess.ID != detail.Session.ID || sess.Title != detail.Session.Title ||
+		sess.ProjectPath != detail.Session.ProjectPath || sess.Vendor != detail.Session.Vendor ||
+		sess.MessageCount != detail.Session.MessageCount {
+		t.Fatalf("LoadSession session %+v != LoadFile session %+v", sess, detail.Session)
+	}
+	if len(msgs) != len(detail.Messages) {
+		t.Fatalf("messages = %d, want %d", len(msgs), len(detail.Messages))
+	}
+	var sidechainFound bool
+	for i := range msgs {
+		if msgs[i].UUID != detail.Messages[i].UUID || msgs[i].Text != detail.Messages[i].Text ||
+			msgs[i].IsSidechain != detail.Messages[i].IsSidechain {
+			t.Fatalf("message %d differs: %+v vs %+v", i, msgs[i], detail.Messages[i])
+		}
+		if msgs[i].IsSidechain {
+			sidechainFound = true
+		}
+	}
+	if !sidechainFound {
+		t.Fatal("expected sidechain message from LoadSession")
+	}
+}
+
 func TestLoadFileBuildsSessionDetail(t *testing.T) {
 	root := t.TempDir()
 	proj := filepath.Join(root, "Users-user1-src-demo")

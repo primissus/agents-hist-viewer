@@ -45,16 +45,55 @@ func LoadFile(ctx context.Context, filePath string, opts domain.IndexOptions) (d
 	}
 
 	chatID := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
-	sessionID := SessionID(chatID)
+	sess, messages, err := loadSessionFile(ctx, filePath, SessionID(chatID), opts)
+	if err != nil {
+		return domain.SessionDetail{}, err
+	}
+	return domain.SessionDetail{Session: sess, Messages: messages}, nil
+}
+
+// LoadSession parses a session's metadata and messages in one pass.
+func (s *Source) LoadSession(ctx context.Context, sessionID string) (domain.Session, []domain.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.Session{}, nil, err
+	}
+	chatID := strings.TrimPrefix(sessionID, "cursor:")
+	filePath, err := s.findFile(chatID)
+	if err != nil {
+		return domain.Session{}, nil, err
+	}
+	return loadSessionFile(ctx, filePath, sessionID, s.opts)
+}
+
+// loadSessionFile reads the main transcript and sidechain files once,
+// accumulating metadata and messages in the same callback.
+func loadSessionFile(ctx context.Context, filePath, sessionID string, opts domain.IndexOptions) (domain.Session, []domain.Message, error) {
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return domain.Session{}, nil, err
+	}
+	chatID := strings.TrimPrefix(sessionID, "cursor:")
 	projectPath := projectPathForFile(filePath)
 	baseTS := info.ModTime().UTC()
-	sess := scanMeta(filePath, chatID, projectPath, baseTS)
+	sess := domain.Session{
+		ID:            SessionID(chatID),
+		ProjectPath:   projectPath,
+		FilePath:      filePath,
+		HasTranscript: true,
+		Vendor:        domain.VendorCursor,
+		RecordKind:    domain.RecordChat,
+		StartedAt:     baseTS,
+		EndedAt:       baseTS,
+	}
 
 	seq := 0
 	var messages []domain.Message
 	appendRecord := func(rec record, line int, isSidechain bool) error {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if !isSidechain && sess.Title == "" {
+			sess.Title = firstUserTitle(rec)
 		}
 		return parseRecord(rec, line, baseTS, sessionID, isSidechain, &seq, opts, func(m domain.Message) error {
 			m.ProjectPath = projectPath
@@ -65,7 +104,7 @@ func LoadFile(ctx context.Context, filePath string, opts domain.IndexOptions) (d
 	if err := streamFile(filePath, func(rec record, line int) error {
 		return appendRecord(rec, line, false)
 	}); err != nil {
-		return domain.SessionDetail{}, err
+		return domain.Session{}, nil, err
 	}
 
 	scDir := filepath.Join(filepath.Dir(filePath), "subagents")
@@ -86,7 +125,7 @@ func LoadFile(ctx context.Context, filePath string, opts domain.IndexOptions) (d
 	if sess.ProjectPath == "" {
 		sess.ProjectPath = projectPath
 	}
-	return domain.SessionDetail{Session: sess, Messages: messages}, nil
+	return sess, messages, nil
 }
 
 func (s *Source) Sessions(ctx context.Context) ([]domain.Session, error) {

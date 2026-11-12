@@ -185,6 +185,51 @@ func TestQuickIndexSkipsNonUserBlocks(t *testing.T) {
 	}
 }
 
+func TestLoadSessionMatchesLoadFile(t *testing.T) {
+	src := setupSource(t)
+	filePath := filepath.Join(mustSourceRoot(t, src), "proj1", "sess-abc.jsonl")
+
+	detail, err := transcript.LoadFile(context.Background(), filePath, domain.DefaultIndexOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, msgs, err := src.LoadSession(context.Background(), "sess-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if sess.ID != detail.Session.ID || sess.Title != detail.Session.Title ||
+		sess.ProjectPath != detail.Session.ProjectPath || sess.Vendor != detail.Session.Vendor ||
+		sess.RecordKind != detail.Session.RecordKind || sess.HasTranscript != detail.Session.HasTranscript ||
+		sess.MessageCount != detail.Session.MessageCount {
+		t.Fatalf("LoadSession session %+v != LoadFile session %+v", sess, detail.Session)
+	}
+	if !sess.StartedAt.Equal(detail.Session.StartedAt) || !sess.EndedAt.Equal(detail.Session.EndedAt) {
+		t.Fatalf("timestamps differ: %v/%v vs %v/%v", sess.StartedAt, sess.EndedAt, detail.Session.StartedAt, detail.Session.EndedAt)
+	}
+	if len(msgs) != len(detail.Messages) {
+		t.Fatalf("messages = %d, want %d", len(msgs), len(detail.Messages))
+	}
+	for i := range msgs {
+		a, b := msgs[i], detail.Messages[i]
+		if a.UUID != b.UUID || a.Text != b.Text || a.Sequence != b.Sequence ||
+			a.Role != b.Role || a.Kind != b.Kind || a.IsSidechain != b.IsSidechain {
+			t.Fatalf("message %d differs:\n got %+v\nwant %+v", i, a, b)
+		}
+	}
+}
+
+func mustSourceRoot(t *testing.T, src *transcript.Source) string {
+	t.Helper()
+	// setupSource creates the fixture under a temp dir; find it through the
+	// session the source already knows about.
+	sessions, err := src.Sessions(context.Background())
+	if err != nil || len(sessions) == 0 {
+		t.Fatalf("sessions: %v %v", sessions, err)
+	}
+	return filepath.Dir(filepath.Dir(sessions[0].FilePath))
+}
+
 func TestLoadFileBuildsSessionDetail(t *testing.T) {
 	detail, err := transcript.LoadFile(context.Background(), samplePath, domain.DefaultIndexOptions)
 	if err != nil {

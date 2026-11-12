@@ -38,6 +38,12 @@ type TranscriptMetaSource interface {
 	SessionMeta(ctx context.Context, sessionID string) (Session, error)
 }
 
+// TranscriptSessionLoader optionally loads metadata and messages for one
+// session in a single parse pass, avoiding a second full-file scan.
+type TranscriptSessionLoader interface {
+	LoadSession(ctx context.Context, sessionID string) (Session, []Message, error)
+}
+
 type PromptLog interface {
 	Prompts(ctx context.Context) ([]Prompt, error)
 }

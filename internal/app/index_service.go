@@ -272,18 +272,31 @@ func (r *indexRun) catalogSession(ctx context.Context, id string, d discoveredTr
 		}
 	}
 
-	sess, err := d.meta.SessionMeta(ctx, id)
-	if err != nil {
-		return r.fail("session meta failed id=%s: %w", id, err)
-	}
-	if d.session != nil {
-		sess = mergeSessionMetadata(*d.session, sess)
-	}
 	msgSource := d.messageSource
 	if msgSource == nil {
 		msgSource = d.source
 	}
-	msgs, loadedSource, loaded := r.svc.loadMessages(ctx, id, candidateSources(msgSource), r.opts.Debug)
+	var sess domain.Session
+	var msgs []domain.Message
+	var loadedSource domain.TranscriptSource
+	loaded := false
+	if loader, ok := msgSource.(domain.TranscriptSessionLoader); ok {
+		loadedSess, loadedMsgs, err := loader.LoadSession(ctx, id)
+		if err != nil {
+			return r.fail("load session failed id=%s: %w", id, err)
+		}
+		sess, msgs, loadedSource, loaded = loadedSess, loadedMsgs, msgSource, len(loadedMsgs) > 0
+	} else {
+		var err error
+		sess, err = d.meta.SessionMeta(ctx, id)
+		if err != nil {
+			return r.fail("session meta failed id=%s: %w", id, err)
+		}
+		msgs, loadedSource, loaded = r.svc.loadMessages(ctx, id, candidateSources(msgSource), r.opts.Debug)
+	}
+	if d.session != nil {
+		sess = mergeSessionMetadata(*d.session, sess)
+	}
 	if !loaded {
 		debugf(r.opts.Debug, "skip transcript id=%s reason=no_messages elapsed=%s", id, time.Since(sessionStart).Round(time.Millisecond))
 		return nil

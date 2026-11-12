@@ -42,50 +42,123 @@ func LoadFile(ctx context.Context, filePath string, opts domain.IndexOptions) (d
 		return domain.SessionDetail{}, fmt.Errorf("%s is a directory", filePath)
 	}
 
-	fallbackID := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
-	sessionID := scanSessionID(filePath, fallbackID)
-	meta, err := scanSessionMeta(filePath, sessionID)
+	sess, messages, err := loadSessionFile(ctx, filePath, "", opts)
 	if err != nil {
 		return domain.SessionDetail{}, err
 	}
+	for i := range messages {
+		if messages[i].SessionID == "" {
+			messages[i].SessionID = sess.ID
+		}
+	}
+	return domain.SessionDetail{Session: sess, Messages: messages}, nil
+}
 
+// LoadSessionFile loads a single transcript file by path, for adapters (Claude
+// Desktop) that delegate to the Claude transcript parser.
+func LoadSessionFile(ctx context.Context, filePath, sessionID string, opts domain.IndexOptions) (domain.Session, []domain.Message, error) {
+	return loadSessionFile(ctx, filePath, sessionID, opts)
+}
+
+// LoadSession parses a session's metadata and messages in one pass.
+func (s *Source) LoadSession(ctx context.Context, sessionID string) (domain.Session, []domain.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.Session{}, nil, err
+	}
+	filePath, err := s.findFile(sessionID)
+	if err != nil {
+		return domain.Session{}, nil, err
+	}
+	return loadSessionFile(ctx, filePath, sessionID, s.opts)
+}
+
+// loadSessionFile reads the main transcript and its sidechain files once,
+// accumulating metadata and messages in the same callback. An empty sessionID
+// falls back to the first envelope session id, then to the file name.
+func loadSessionFile(ctx context.Context, filePath, sessionID string, opts domain.IndexOptions) (domain.Session, []domain.Message, error) {
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return domain.Session{}, nil, err
+	}
+
+	meta := &sessionMeta{}
+	envSessionID := ""
 	seq := 0
 	var messages []domain.Message
-	appendEnv := func(env envelope) error {
+
+	consume := func(env envelope) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if env.IsMeta {
-			return nil
+		switch env.Type {
+		case "ai-title":
+			meta.aiTitle = env.AiTitle
+		case "custom-title":
+			meta.customTitle = env.CustomTitle
 		}
 		if env.Type != "user" && env.Type != "assistant" {
 			return nil
 		}
+		if env.IsMeta {
+			return nil
+		}
+		if envSessionID == "" && env.SessionID != "" {
+			envSessionID = env.SessionID
+		}
+		ts := parseTime(env.Timestamp)
+		if meta.minTS.IsZero() || ts.Before(meta.minTS) {
+			meta.minTS = ts
+		}
+		if ts.After(meta.maxTS) {
+			meta.maxTS = ts
+		}
+		if env.CWD != "" {
+			meta.session.ProjectPath = env.CWD
+		}
+		if env.GitBranch != "" {
+			meta.session.GitBranch = env.GitBranch
+		}
+		meta.msgCount++
 		return parseMessages(env, &seq, opts, func(m domain.Message) error {
-			if m.SessionID == "" {
-				m.SessionID = sessionID
-			}
 			messages = append(messages, m)
 			return nil
 		})
 	}
-	if err := streamFile(filePath, appendEnv); err != nil {
-		return domain.SessionDetail{}, err
+	if err := streamFile(filePath, consume); err != nil {
+		return domain.Session{}, nil, err
 	}
 
-	scDir := filepath.Join(filepath.Dir(filePath), sessionID, "subagents")
-	scEntries, _ := os.ReadDir(scDir)
-	for _, e := range scEntries {
-		if e.IsDir() || !strings.HasPrefix(e.Name(), "agent-") || !strings.HasSuffix(e.Name(), ".jsonl") {
+	scID := sessionID
+	if scID == "" {
+		scID = envSessionID
+	}
+	if scID == "" {
+		scID = strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
+	}
+	consumeSidechain := func(env envelope) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if env.IsMeta || (env.Type != "user" && env.Type != "assistant") {
+			return nil
+		}
+		env.IsSidechain = true
+		return parseMessages(env, &seq, opts, func(m domain.Message) error {
+			messages = append(messages, m)
+			return nil
+		})
+	}
+	for _, scPath := range claudeSidechainPaths(filePath, scID) {
+		if err := streamFile(scPath, consumeSidechain); err != nil {
 			continue
 		}
-		scPath := filepath.Join(scDir, e.Name())
-		if err := streamFile(scPath, func(env envelope) error {
-			env.IsSidechain = true
-			return appendEnv(env)
-		}); err != nil {
-			continue
-		}
+	}
+
+	if sessionID == "" {
+		sessionID = envSessionID
+	}
+	if sessionID == "" {
+		sessionID = strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
 	}
 
 	sess := meta.session
@@ -113,8 +186,7 @@ func LoadFile(ctx context.Context, filePath string, opts domain.IndexOptions) (d
 	if sess.ProjectPath == "" {
 		sess.ProjectPath = filepath.Dir(filePath)
 	}
-
-	return domain.SessionDetail{Session: sess, Messages: messages}, nil
+	return sess, messages, nil
 }
 
 // sessionMeta holds title resolution and time-range state during scan.
@@ -384,17 +456,6 @@ func transcriptFingerprintForFiles(paths []string, opts domain.IndexOptions) (do
 		Path: mainPath,
 		Hash: "transcript-meta-v1:" + hex.EncodeToString(sum[:]),
 	}, nil
-}
-
-func scanSessionID(filePath, fallback string) string {
-	sessionID := fallback
-	_ = streamFile(filePath, func(env envelope) error {
-		if env.SessionID != "" {
-			sessionID = env.SessionID
-		}
-		return nil
-	})
-	return sessionID
 }
 
 func firstUserTitle(messages []domain.Message) string {

@@ -66,6 +66,31 @@ func TestMessagesDelegateToClaudeTranscript(t *testing.T) {
 	}
 }
 
+func TestLoadSessionLayersDesktopMetadata(t *testing.T) {
+	root, claudeRoot := writeDesktopFixture(t, "sess-load", "Load Title")
+	src := desktoptranscript.NewSource(root, claudeRoot, domain.DefaultIndexOptions)
+
+	sess, msgs, err := src.LoadSession(context.Background(), "sess-load")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) == 0 {
+		t.Fatal("expected messages from the linked transcript")
+	}
+	if sess.Vendor != domain.VendorClaudeDesktop {
+		t.Fatalf("vendor = %q, want claude-desktop", sess.Vendor)
+	}
+	if sess.Title != "Load Title" {
+		t.Fatalf("title = %q, want desktop metadata title", sess.Title)
+	}
+	if sess.ProjectPath != "/tmp/desktop-project" {
+		t.Fatalf("project = %q, want desktop metadata cwd", sess.ProjectPath)
+	}
+	if sess.MessageCount != len(msgs) {
+		t.Fatalf("message count = %d, messages = %d", sess.MessageCount, len(msgs))
+	}
+}
+
 func TestTranscriptFingerprintIncludesDesktopMetadata(t *testing.T) {
 	root, claudeRoot := writeDesktopFixture(t, "sess-fingerprint", "Before")
 	src := desktoptranscript.NewSource(root, claudeRoot, domain.DefaultIndexOptions)

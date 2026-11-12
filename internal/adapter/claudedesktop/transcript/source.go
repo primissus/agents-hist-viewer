@@ -80,6 +80,27 @@ func (s *Source) Messages(ctx context.Context, sessionID string, yield func(doma
 	return nil
 }
 
+// LoadSession parses the linked Claude transcript once and layers Desktop
+// metadata (vendor, title) on top.
+func (s *Source) LoadSession(ctx context.Context, sessionID string) (domain.Session, []domain.Message, error) {
+	rec, err := s.record(ctx, sessionID)
+	if err != nil {
+		return domain.Session{}, nil, err
+	}
+	sess, msgs, err := claudetranscript.LoadSessionFile(ctx, rec.transcriptPath, sessionID, s.opts)
+	if err != nil {
+		return domain.Session{}, nil, err
+	}
+	sess.Vendor = domain.VendorClaudeDesktop
+	if rec.session.Title != "" {
+		sess.Title = rec.session.Title
+	}
+	if rec.session.ProjectPath != "" {
+		sess.ProjectPath = rec.session.ProjectPath
+	}
+	return sess, msgs, nil
+}
+
 func (s *Source) TranscriptFingerprint(ctx context.Context, sessionID string) (domain.TranscriptFingerprint, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.TranscriptFingerprint{}, err
