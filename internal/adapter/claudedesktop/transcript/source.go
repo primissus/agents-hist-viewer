@@ -63,6 +63,38 @@ func (s *Source) Sessions(ctx context.Context) ([]domain.Session, error) {
 	return sessions, nil
 }
 
+// TranscriptCatalog lists desktop sessions with stat-only fingerprints,
+// reusing the per-source record scan.
+func (s *Source) TranscriptCatalog(ctx context.Context) ([]domain.TranscriptCatalogEntry, error) {
+	records, err := s.records(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]domain.TranscriptCatalogEntry, 0, len(records))
+	for _, rec := range records {
+		paths := append([]string{rec.metaPath, rec.transcriptPath}, sidechainPaths(rec.transcriptPath, rec.session.ID)...)
+		fp, err := fingerprintForFiles(paths, s.opts)
+		if err != nil {
+			continue
+		}
+		out = append(out, domain.TranscriptCatalogEntry{
+			ID:          rec.session.ID,
+			Vendor:      domain.VendorClaudeDesktop,
+			Fingerprint: fp,
+		})
+	}
+	return out, nil
+}
+
+// SessionMeta returns the already-parsed desktop record metadata.
+func (s *Source) SessionMeta(ctx context.Context, sessionID string) (domain.Session, error) {
+	rec, err := s.record(ctx, sessionID)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	return rec.session, nil
+}
+
 func (s *Source) Messages(ctx context.Context, sessionID string, yield func(domain.Message) error) error {
 	rec, err := s.record(ctx, sessionID)
 	if err != nil {

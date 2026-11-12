@@ -1,12 +1,16 @@
 package transcript_test
 
 import (
+	"context"
 	"database/sql"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"claude-code-hist-viewer/internal/adapter/opencode/transcript"
+	"claude-code-hist-viewer/internal/adapter/sqlite"
+	"claude-code-hist-viewer/internal/app"
+	"claude-code-hist-viewer/internal/config"
 	"claude-code-hist-viewer/internal/domain"
 
 	_ "modernc.org/sqlite"
@@ -204,6 +208,74 @@ func TestMessagesMapPartsAndSidechains(t *testing.T) {
 		if m.Role == "" {
 			t.Error("expected non-empty role")
 		}
+	}
+}
+
+type countingOpenCodeSource struct {
+	*transcript.Source
+	metaCalls int
+	msgCalls  int
+}
+
+func (c *countingOpenCodeSource) SessionMeta(ctx context.Context, id string) (domain.Session, error) {
+	c.metaCalls++
+	return c.Source.SessionMeta(ctx, id)
+}
+
+func (c *countingOpenCodeSource) Messages(ctx context.Context, id string, yield func(domain.Message) error) error {
+	c.msgCalls++
+	return c.Source.Messages(ctx, id, yield)
+}
+
+func TestCatalogSkipsUnchangedOpenCodeSessions(t *testing.T) {
+	path := newTestDBPath(t)
+	db := openOpenCodeAt(t, path)
+	seedOpenCodeData(t, db)
+
+	tracked := &countingOpenCodeSource{Source: transcript.NewSource(path, domain.DefaultIndexOptions)}
+	repo, err := sqlite.Open(filepath.Join(t.TempDir(), "opencode-index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { repo.Close() })
+	svc := app.NewIndexService(tracked, nil, nil, repo, domain.DefaultShrinkConfig)
+	home := t.TempDir()
+
+	stats1, err := svc.Run(t.Context(), config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats1.Indexed != 1 || stats1.Messages == 0 {
+		t.Fatalf("first run should index, got %+v", stats1)
+	}
+	meta1, msg1 := tracked.metaCalls, tracked.msgCalls
+
+	stats2, err := svc.Run(t.Context(), config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats2.Skipped != 1 || stats2.Indexed != 0 {
+		t.Fatalf("second run should skip, got %+v", stats2)
+	}
+	if tracked.metaCalls != meta1 || tracked.msgCalls != msg1 {
+		t.Fatalf("unchanged session was parsed again: meta %d->%d messages %d->%d", meta1, tracked.metaCalls, msg1, tracked.msgCalls)
+	}
+
+	exec(t, db, `UPDATE session SET time_updated = 1700000009000 WHERE id = 'ses_root'`)
+	stats3, err := svc.Run(t.Context(), config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats3.Indexed != 1 {
+		t.Fatalf("changed fingerprint should re-index, got %+v", stats3)
+	}
+
+	stats4, err := svc.RunWithOptions(t.Context(), config.IndexConfig{}, home, nil, app.IndexRunOptions{Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats4.Indexed != 1 {
+		t.Fatalf("force should re-index, got %+v", stats4)
 	}
 }
 

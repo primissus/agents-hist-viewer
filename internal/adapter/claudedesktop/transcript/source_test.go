@@ -9,6 +9,9 @@ import (
 	"time"
 
 	desktoptranscript "claude-code-hist-viewer/internal/adapter/claudedesktop/transcript"
+	"claude-code-hist-viewer/internal/adapter/sqlite"
+	"claude-code-hist-viewer/internal/app"
+	"claude-code-hist-viewer/internal/config"
 	"claude-code-hist-viewer/internal/domain"
 )
 
@@ -88,6 +91,87 @@ func TestLoadSessionLayersDesktopMetadata(t *testing.T) {
 	}
 	if sess.MessageCount != len(msgs) {
 		t.Fatalf("message count = %d, messages = %d", sess.MessageCount, len(msgs))
+	}
+}
+
+type countingDesktopSource struct {
+	*desktoptranscript.Source
+	loadCalls int
+	metaCalls int
+	msgCalls  int
+}
+
+func (c *countingDesktopSource) LoadSession(ctx context.Context, id string) (domain.Session, []domain.Message, error) {
+	c.loadCalls++
+	return c.Source.LoadSession(ctx, id)
+}
+
+func (c *countingDesktopSource) SessionMeta(ctx context.Context, id string) (domain.Session, error) {
+	c.metaCalls++
+	return c.Source.SessionMeta(ctx, id)
+}
+
+func (c *countingDesktopSource) Messages(ctx context.Context, id string, yield func(domain.Message) error) error {
+	c.msgCalls++
+	return c.Source.Messages(ctx, id, yield)
+}
+
+func TestCatalogSkipsUnchangedDesktopSessions(t *testing.T) {
+	root, claudeRoot := writeDesktopFixture(t, "sess-cat-desktop", "Catalog Desktop")
+	tracked := &countingDesktopSource{Source: desktoptranscript.NewSource(root, claudeRoot, domain.DefaultIndexOptions)}
+	repo, err := sqlite.Open(filepath.Join(t.TempDir(), "desktop.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { repo.Close() })
+	svc := app.NewIndexService(tracked, nil, nil, repo, domain.DefaultShrinkConfig)
+	home := t.TempDir()
+
+	stats1, err := svc.Run(t.Context(), config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats1.Indexed != 1 || stats1.Messages == 0 {
+		t.Fatalf("first run should index, got %+v", stats1)
+	}
+	if tracked.loadCalls != 1 || tracked.metaCalls != 0 || tracked.msgCalls != 0 {
+		t.Fatalf("expected single-pass load, got load=%d meta=%d messages=%d", tracked.loadCalls, tracked.metaCalls, tracked.msgCalls)
+	}
+	loads1 := tracked.loadCalls
+
+	stats2, err := svc.Run(t.Context(), config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats2.Skipped != 1 || stats2.Indexed != 0 {
+		t.Fatalf("second run should skip, got %+v", stats2)
+	}
+	if tracked.loadCalls != loads1 || tracked.metaCalls != 0 || tracked.msgCalls != 0 {
+		t.Fatalf("unchanged session parsed again: load=%d meta=%d messages=%d", tracked.loadCalls, tracked.metaCalls, tracked.msgCalls)
+	}
+
+	localPath := filepath.Join(root, "claude-code-sessions", "org", "account", "local_sess-cat-desktop.json")
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(localPath, []byte(strings.Replace(string(data), "Catalog Desktop", "Changed Desktop", 1)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	stats3, err := svc.Run(t.Context(), config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats3.Indexed != 1 {
+		t.Fatalf("changed fingerprint should re-index, got %+v", stats3)
+	}
+
+	stats4, err := svc.RunWithOptions(t.Context(), config.IndexConfig{}, home, nil, app.IndexRunOptions{Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats4.Indexed != 1 {
+		t.Fatalf("force should re-index, got %+v", stats4)
 	}
 }
 

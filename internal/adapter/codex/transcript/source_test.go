@@ -1,12 +1,16 @@
 package transcript_test
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"claude-code-hist-viewer/internal/adapter/codex/transcript"
+	"claude-code-hist-viewer/internal/adapter/sqlite"
+	"claude-code-hist-viewer/internal/app"
+	"claude-code-hist-viewer/internal/config"
 	"claude-code-hist-viewer/internal/domain"
 )
 
@@ -151,6 +155,76 @@ func TestMissingRootYieldsNoSessions(t *testing.T) {
 	}
 	if len(sessions) != 0 {
 		t.Fatalf("expected no sessions, got %d", len(sessions))
+	}
+}
+
+type countingCodexSource struct {
+	*transcript.Source
+	metaCalls int
+	msgCalls  int
+}
+
+func (c *countingCodexSource) SessionMeta(ctx context.Context, id string) (domain.Session, error) {
+	c.metaCalls++
+	return c.Source.SessionMeta(ctx, id)
+}
+
+func (c *countingCodexSource) Messages(ctx context.Context, id string, yield func(domain.Message) error) error {
+	c.msgCalls++
+	return c.Source.Messages(ctx, id, yield)
+}
+
+func TestCatalogSkipsUnchangedCodexSessions(t *testing.T) {
+	root := t.TempDir()
+	path := writeRollout(t, root, "2026/09/01", "rollout-1-uuid.jsonl", sampleRollout)
+
+	tracked := &countingCodexSource{Source: transcript.NewSource(root, domain.DefaultIndexOptions)}
+	repo, err := sqlite.Open(filepath.Join(t.TempDir(), "codex.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { repo.Close() })
+	svc := app.NewIndexService(tracked, nil, nil, repo, domain.DefaultShrinkConfig)
+	home := t.TempDir()
+
+	stats1, err := svc.Run(t.Context(), config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats1.Indexed != 1 || stats1.Messages == 0 {
+		t.Fatalf("first run should index, got %+v", stats1)
+	}
+	meta1, msg1 := tracked.metaCalls, tracked.msgCalls
+
+	stats2, err := svc.Run(t.Context(), config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats2.Skipped != 1 || stats2.Indexed != 0 {
+		t.Fatalf("second run should skip, got %+v", stats2)
+	}
+	if tracked.metaCalls != meta1 || tracked.msgCalls != msg1 {
+		t.Fatalf("unchanged session was parsed again: meta %d->%d messages %d->%d", meta1, tracked.metaCalls, msg1, tracked.msgCalls)
+	}
+
+	changed := sampleRollout + `{"timestamp":"2026-09-01T10:00:07.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"changed codex text"}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(changed), 0644); err != nil {
+		t.Fatal(err)
+	}
+	stats3, err := svc.Run(t.Context(), config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats3.Indexed != 1 {
+		t.Fatalf("changed fingerprint should re-index, got %+v", stats3)
+	}
+
+	stats4, err := svc.RunWithOptions(t.Context(), config.IndexConfig{}, home, nil, app.IndexRunOptions{Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats4.Indexed != 1 {
+		t.Fatalf("force should re-index, got %+v", stats4)
 	}
 }
 

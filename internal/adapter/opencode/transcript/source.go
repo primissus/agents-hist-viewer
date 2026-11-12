@@ -104,28 +104,7 @@ WHERE s.parent_id IS NULL`)
 		if err := rows.Scan(&id, &directory, &title, &timeCreated, &timeUpdated, &msgCount); err != nil {
 			return nil, err
 		}
-		started := millisToTime(timeCreated)
-		ended := millisToTime(timeUpdated)
-		if started.IsZero() {
-			started = ended
-		}
-		if ended.IsZero() {
-			ended = started
-		}
-		if title == "" {
-			title = s.deriveTitle(ctx, db, id)
-		}
-		sessions = append(sessions, domain.Session{
-			ID:            SessionID(id),
-			Title:         title,
-			ProjectPath:   directory,
-			StartedAt:     started,
-			EndedAt:       ended,
-			MessageCount:  int(msgCount),
-			HasTranscript: true,
-			RecordKind:    domain.RecordChat,
-			Vendor:        domain.VendorOpencode,
-		})
+		sessions = append(sessions, s.sessionFromValues(ctx, db, id, directory, title, timeCreated, timeUpdated, msgCount))
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -134,6 +113,97 @@ WHERE s.parent_id IS NULL`)
 		return sessions[i].StartedAt.After(sessions[j].StartedAt)
 	})
 	return sessions, nil
+}
+
+// TranscriptCatalog lists root sessions with a stat-free fingerprint based on
+// the session timestamp and its combined root+child message count.
+func (s *Source) TranscriptCatalog(ctx context.Context) ([]domain.TranscriptCatalogEntry, error) {
+	db, err := s.open()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	rows, err := db.QueryContext(ctx, `
+SELECT s.id, s.time_updated,
+       (SELECT COUNT(*) FROM message m WHERE m.session_id = s.id)
+       + (SELECT COUNT(*) FROM message m JOIN session c ON c.id = m.session_id WHERE c.parent_id = s.id)
+FROM session s
+WHERE s.parent_id IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []domain.TranscriptCatalogEntry
+	for rows.Next() {
+		var id string
+		var timeUpdated, msgCount int64
+		if err := rows.Scan(&id, &timeUpdated, &msgCount); err != nil {
+			return nil, err
+		}
+		out = append(out, domain.TranscriptCatalogEntry{
+			ID:     SessionID(id),
+			Vendor: domain.VendorOpencode,
+			Fingerprint: domain.TranscriptFingerprint{
+				Path: SessionID(id),
+				Hash: fmt.Sprintf("opencode-session-meta-v1:%d-%d", timeUpdated, msgCount),
+			},
+		})
+	}
+	return out, rows.Err()
+}
+
+// SessionMeta resolves metadata (including the title fallback) for one root
+// session, without listing every session.
+func (s *Source) SessionMeta(ctx context.Context, sessionID string) (domain.Session, error) {
+	db, err := s.open()
+	if err != nil {
+		return domain.Session{}, err
+	}
+	id := strings.TrimPrefix(sessionID, "opencode:")
+
+	var directory, title string
+	var timeCreated, timeUpdated, msgCount int64
+	err = db.QueryRowContext(ctx, `
+SELECT s.directory, s.title, s.time_created, s.time_updated,
+       COALESCE((SELECT COUNT(*) FROM message m WHERE m.session_id = s.id), 0)
+FROM session s
+WHERE s.id = ? AND s.parent_id IS NULL`, id).Scan(&directory, &title, &timeCreated, &timeUpdated, &msgCount)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return domain.Session{}, os.ErrNotExist
+		}
+		return domain.Session{}, err
+	}
+	return s.sessionFromValues(ctx, db, id, directory, title, timeCreated, timeUpdated, msgCount), nil
+}
+
+func (s *Source) sessionFromValues(ctx context.Context, db *sql.DB, id, directory, title string, timeCreated, timeUpdated, msgCount int64) domain.Session {
+	started := millisToTime(timeCreated)
+	ended := millisToTime(timeUpdated)
+	if started.IsZero() {
+		started = ended
+	}
+	if ended.IsZero() {
+		ended = started
+	}
+	if title == "" {
+		title = s.deriveTitle(ctx, db, id)
+	}
+	return domain.Session{
+		ID:            SessionID(id),
+		Title:         title,
+		ProjectPath:   directory,
+		StartedAt:     started,
+		EndedAt:       ended,
+		MessageCount:  int(msgCount),
+		HasTranscript: true,
+		RecordKind:    domain.RecordChat,
+		Vendor:        domain.VendorOpencode,
+	}
 }
 
 func (s *Source) Messages(ctx context.Context, sessionID string, yield func(domain.Message) error) error {

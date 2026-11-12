@@ -1,12 +1,16 @@
 package transcript_test
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"claude-code-hist-viewer/internal/adapter/cursor/transcript"
+	"claude-code-hist-viewer/internal/adapter/sqlite"
+	"claude-code-hist-viewer/internal/app"
+	"claude-code-hist-viewer/internal/config"
 	"claude-code-hist-viewer/internal/domain"
 )
 
@@ -141,6 +145,78 @@ func TestTranscriptCatalogMatchesFingerprintAndMeta(t *testing.T) {
 	}
 	if meta.ID != sessions[0].ID || meta.Title != sessions[0].Title || meta.ProjectPath != sessions[0].ProjectPath || meta.StartedAt != sessions[0].StartedAt || meta.MessageCount != sessions[0].MessageCount {
 		t.Fatalf("session meta %+v != discovered session %+v", meta, sessions[0])
+	}
+}
+
+type countingCursorSource struct {
+	*transcript.Source
+	loadCalls int
+}
+
+func (c *countingCursorSource) LoadSession(ctx context.Context, id string) (domain.Session, []domain.Message, error) {
+	c.loadCalls++
+	return c.Source.LoadSession(ctx, id)
+}
+
+func TestCatalogSkipsUnchangedCursorSessions(t *testing.T) {
+	root := t.TempDir()
+	proj := filepath.Join(root, "Users-user1-src-demo")
+	if err := os.MkdirAll(filepath.Join(proj, "agent-transcripts", "chat-skip"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	jsonl := filepath.Join(proj, "agent-transcripts", "chat-skip", "chat-skip.jsonl")
+	content := `{"role":"user","message":{"content":[{"type":"text","text":"cursor skip phrase"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"reply here"}]}}`
+	if err := os.WriteFile(jsonl, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	tracked := &countingCursorSource{Source: transcript.NewSource(root, domain.DefaultIndexOptions)}
+	repo, err := sqlite.Open(filepath.Join(t.TempDir(), "cursor.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { repo.Close() })
+	svc := app.NewIndexService(tracked, nil, nil, repo, domain.DefaultShrinkConfig)
+	home := t.TempDir()
+
+	stats1, err := svc.Run(t.Context(), config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats1.Indexed != 1 || stats1.Messages == 0 {
+		t.Fatalf("first run should index, got %+v", stats1)
+	}
+	loads1 := tracked.loadCalls
+
+	stats2, err := svc.Run(t.Context(), config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats2.Skipped != 1 || stats2.Indexed != 0 {
+		t.Fatalf("second run should skip, got %+v", stats2)
+	}
+	if tracked.loadCalls != loads1 {
+		t.Fatalf("unchanged session parsed again: loads %d->%d", loads1, tracked.loadCalls)
+	}
+
+	if err := os.WriteFile(jsonl, []byte(content+`{"role":"user","message":{"content":[{"type":"text","text":"changed cursor text"}]}}`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	stats3, err := svc.Run(t.Context(), config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats3.Indexed != 1 {
+		t.Fatalf("changed fingerprint should re-index, got %+v", stats3)
+	}
+
+	stats4, err := svc.RunWithOptions(t.Context(), config.IndexConfig{}, home, nil, app.IndexRunOptions{Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats4.Indexed != 1 {
+		t.Fatalf("force should re-index, got %+v", stats4)
 	}
 }
 

@@ -95,6 +95,7 @@ func (s *Source) Sessions(ctx context.Context) ([]domain.Session, error) {
 		if meta.ID == "" {
 			continue
 		}
+		s.rememberPath(meta.ID, path)
 		sess := sessionFromMeta(meta, path, info.ModTime().UTC())
 		sess.Title = scanTitle(path)
 		sessions = append(sessions, sess)
@@ -104,6 +105,64 @@ func (s *Source) Sessions(ctx context.Context) ([]domain.Session, error) {
 		return sessions[i].StartedAt.After(sessions[j].StartedAt)
 	})
 	return sessions, nil
+}
+
+// TranscriptCatalog lists rollout sessions with stat-only fingerprints: only
+// the first line of each file is read, never the whole transcript.
+func (s *Source) TranscriptCatalog(ctx context.Context) ([]domain.TranscriptCatalogEntry, error) {
+	files, err := s.rolloutFiles()
+	if err != nil {
+		return nil, err
+	}
+
+	var out []domain.TranscriptCatalogEntry
+	for _, path := range files {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		meta, err := scanSessionMeta(path)
+		if err != nil || meta.ID == "" {
+			continue
+		}
+		fp, err := fingerprintForFile(path, s.opts)
+		if err != nil {
+			continue
+		}
+		s.rememberPath(meta.ID, path)
+		out = append(out, domain.TranscriptCatalogEntry{
+			ID:          SessionID(meta.ID),
+			Vendor:      domain.VendorCodex,
+			Fingerprint: fp,
+		})
+	}
+	return out, nil
+}
+
+// SessionMeta resolves metadata (including the title scan) for one changed
+// session, without walking every rollout file.
+func (s *Source) SessionMeta(ctx context.Context, sessionID string) (domain.Session, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.Session{}, err
+	}
+	id := strings.TrimPrefix(sessionID, "codex:")
+	filePath, err := s.findFile(id)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	meta, err := scanSessionMeta(filePath)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	if meta.ID == "" {
+		return domain.Session{}, os.ErrNotExist
+	}
+	sess := sessionFromMeta(meta, filePath, info.ModTime().UTC())
+	sess.Title = scanTitle(filePath)
+	return sess, nil
 }
 
 func (s *Source) Messages(ctx context.Context, sessionID string, yield func(domain.Message) error) error {
@@ -195,6 +254,17 @@ func (s *Source) findFile(id string) (string, error) {
 		return "", os.ErrNotExist
 	}
 	return path, nil
+}
+
+func (s *Source) rememberPath(id, path string) {
+	s.mu.Lock()
+	if s.index == nil {
+		s.index = make(map[string]string)
+	}
+	if _, ok := s.index[id]; !ok {
+		s.index[id] = path
+	}
+	s.mu.Unlock()
 }
 
 func sessionFromMeta(meta sessionMeta, filePath string, mod time.Time) domain.Session {
