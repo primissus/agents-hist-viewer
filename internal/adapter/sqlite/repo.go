@@ -17,7 +17,7 @@ var _ domain.SearchRepository = (*Repo)(nil)
 type Repo struct{ db *sql.DB }
 
 func Open(path string) (*Repo, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(wal)&_pragma=foreign_keys(1)")
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(wal)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}

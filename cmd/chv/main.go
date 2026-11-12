@@ -476,6 +476,9 @@ func cmdIndex(args []string) {
 		os.Exit(1)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	configPath := *configFlag
 	if configPath == "" {
 		configPath = config.IndexConfigPath()
@@ -502,9 +505,10 @@ func cmdIndex(args []string) {
 		filePath := pos[0]
 		title := strings.Join(pos[1:], " ")
 		svc := app.NewIndexService(nil, nil, nil, repo, domain.ShrinkConfig{})
-		stats, p, skipped, err := svc.IndexFileWithOptions(context.Background(), filePath, title, app.IndexRunOptions{
+		stats, p, skipped, err := svc.IndexFileWithOptions(ctx, filePath, title, app.IndexRunOptions{
 			Force: *forceFlag,
 			Debug: debugWriter,
+			Warn:  os.Stderr,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "index: %v\n", err)
@@ -557,19 +561,29 @@ func cmdIndex(args []string) {
 		repo,
 		opts.Shrink,
 	)
-	stats, err := svc.RunWithOptions(context.Background(), indexCfg, home, func(done, total int) {
+	lastPct := -1
+	stats, err := svc.RunWithOptions(ctx, indexCfg, home, func(done, total int) {
+		if total == 0 {
+			return
+		}
+		pct := done * 100 / total
+		if done != 0 && done != total && done%100 != 0 && pct == lastPct {
+			return
+		}
+		lastPct = pct
 		fmt.Fprintf(os.Stderr, "\rIndexing %d/%d...", done, total)
 	}, app.IndexRunOptions{
 		Force: *forceFlag,
 		Debug: debugWriter,
+		Warn:  os.Stderr,
 	})
 	fmt.Fprintf(os.Stderr, "\n")
+	fmt.Printf("Sessions: %d  Indexed: %d  Orphaned: %d  Plans: %d  Skipped: %d  Failed: %d  Messages: %d  Elapsed: %s\n",
+		stats.Sessions, stats.Indexed, stats.Orphaned, stats.Plans, stats.Skipped, stats.Failed, stats.Messages, stats.Elapsed.Round(time.Millisecond))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "index: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Sessions: %d  Orphaned: %d  Plans: %d  Skipped: %d  Messages: %d  Elapsed: %s\n",
-		stats.Sessions, stats.Orphaned, stats.Plans, stats.Skipped, stats.Messages, stats.Elapsed.Round(time.Millisecond))
 }
 
 // cmdSearch runs full-text (FTS) search by default. With --semantic it runs

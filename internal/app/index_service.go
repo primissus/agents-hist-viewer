@@ -20,9 +20,11 @@ import (
 
 type IndexStats struct {
 	Sessions int
+	Indexed  int // sessions written (successful ReplaceSession calls)
 	Orphaned int
 	Plans    int
 	Skipped  int
+	Failed   int // per-session/per-plan errors, also returned joined
 	Messages int
 	Elapsed  time.Duration
 }
@@ -30,6 +32,7 @@ type IndexStats struct {
 type IndexRunOptions struct {
 	Force bool
 	Debug io.Writer
+	Warn  io.Writer
 }
 
 type IndexService struct {
@@ -65,10 +68,11 @@ func (s *IndexService) Run(ctx context.Context, indexCfg config.IndexConfig, hom
 // metadata merged in at write time (catalog entries have no metadata, legacy
 // Sessions cannot skip without parsing).
 type discoveredTranscript struct {
-	source  domain.TranscriptSource
-	session *domain.Session
-	catalog *domain.TranscriptCatalogEntry
-	meta    domain.TranscriptMetaSource
+	source        domain.TranscriptSource
+	messageSource domain.TranscriptSource
+	session       *domain.Session
+	catalog       *domain.TranscriptCatalogEntry
+	meta          domain.TranscriptMetaSource
 }
 
 // indexRun carries per-run state shared by the session handlers.
@@ -77,6 +81,7 @@ type indexRun struct {
 	opts   IndexRunOptions
 	hashes map[string]string
 	stats  *IndexStats
+	errs   []error
 }
 
 func (s *IndexService) RunWithOptions(ctx context.Context, indexCfg config.IndexConfig, home string, progress func(done, total int), opts IndexRunOptions) (IndexStats, error) {
@@ -101,7 +106,7 @@ func (s *IndexService) RunWithOptions(ctx context.Context, indexCfg config.Index
 					return IndexStats{}, fmt.Errorf("transcript catalog: %w", err)
 				}
 				for i := range entries {
-					d := discoveredTranscript{source: src, catalog: &entries[i], meta: meta}
+					d := discoveredTranscript{source: src, messageSource: src, catalog: &entries[i], meta: meta}
 					if prev, ok := dMap[entries[i].ID]; ok && prev.session != nil {
 						d.session = prev.session
 					}
@@ -116,9 +121,18 @@ func (s *IndexService) RunWithOptions(ctx context.Context, indexCfg config.Index
 			return IndexStats{}, fmt.Errorf("transcript sessions: %w", err)
 		}
 		for _, sess := range tSessions {
-			d := discoveredTranscript{source: src}
+			d := discoveredTranscript{source: src, messageSource: src}
 			if prev, ok := dMap[sess.ID]; ok {
-				if prev.session != nil {
+				if prev.catalog != nil {
+					// A catalog entry is cheaper to skip with; keep it while the
+					// later source supplies the primary metadata and messages.
+					d.catalog = prev.catalog
+					d.meta = prev.meta
+					d.messageSource = src
+					if prev.session != nil {
+						sess = mergeSessionMetadata(sess, *prev.session)
+					}
+				} else if prev.session != nil {
 					sess = mergeSessionMetadata(sess, *prev.session)
 				} else if prev.meta != nil {
 					d.meta = prev.meta
@@ -167,11 +181,11 @@ func (s *IndexService) RunWithOptions(ctx context.Context, indexCfg config.Index
 		d, ok := dMap[id]
 		switch {
 		case ok && d.catalog != nil:
-			run.catalogSession(ctx, id, d)
+			_ = run.catalogSession(ctx, id, d)
 		case ok:
-			run.transcriptSession(ctx, id, d)
+			_ = run.transcriptSession(ctx, id, d)
 		default:
-			run.promptOnlySession(ctx, id, pMap[id])
+			_ = run.promptOnlySession(ctx, id, pMap[id])
 		}
 	}
 
@@ -179,38 +193,49 @@ func (s *IndexService) RunWithOptions(ctx context.Context, indexCfg config.Index
 		progress(total, total)
 	}
 
-	planStats, err := s.indexPlans(ctx, indexCfg, home, opts)
-	if err != nil {
-		return stats, err
-	}
+	planStats, _ := run.indexPlans(ctx, indexCfg, home)
 	stats.Plans = planStats.Plans
 	stats.Skipped += planStats.Skipped
 	stats.Messages += planStats.Messages
+	stats.Indexed += planStats.Indexed
 
+	stats.Failed = len(run.errs)
 	stats.Elapsed = time.Since(start)
-	debugf(opts.Debug, "index done sessions=%d orphaned=%d plans=%d skipped=%d messages=%d elapsed=%s", stats.Sessions, stats.Orphaned, stats.Plans, stats.Skipped, stats.Messages, stats.Elapsed.Round(time.Millisecond))
+	debugf(opts.Debug, "index done sessions=%d indexed=%d failed=%d orphaned=%d plans=%d skipped=%d messages=%d elapsed=%s", stats.Sessions, stats.Indexed, stats.Failed, stats.Orphaned, stats.Plans, stats.Skipped, stats.Messages, stats.Elapsed.Round(time.Millisecond))
+	if len(run.errs) > 0 {
+		return stats, errors.Join(run.errs...)
+	}
 	return stats, nil
 }
 
+// fail records a per-session/per-plan failure, warns regardless of --debug, and
+// returns it so the caller can propagate it while the run continues.
+func (r *indexRun) fail(format string, args ...any) error {
+	err := fmt.Errorf(format, args...)
+	warnf(r.opts.Warn, "%s", err)
+	r.errs = append(r.errs, err)
+	return err
+}
+
 // transcriptSession indexes a session whose metadata came from Sessions.
-func (r *indexRun) transcriptSession(ctx context.Context, id string, d discoveredTranscript) {
+func (r *indexRun) transcriptSession(ctx context.Context, id string, d discoveredTranscript) error {
 	sessionStart := time.Now()
 	sess := *d.session
 	skipped, fp, matchedSource := r.svc.shouldSkipTranscript(ctx, id, d.source, r.opts, r.hashes)
 	if skipped {
 		r.stats.Skipped++
 		debugf(r.opts.Debug, "skip transcript id=%s path=%s elapsed=%s", id, fp.Path, time.Since(sessionStart).Round(time.Millisecond))
-		return
+		return nil
 	}
 
-	firstSource := matchedSource
-	if firstSource == nil {
-		firstSource = d.source
+	msgSource := d.messageSource
+	if msgSource == nil {
+		msgSource = d.source
 	}
-	msgs, loadedSource, loaded := r.svc.loadMessages(ctx, id, firstSource, r.opts.Debug)
+	msgs, loadedSource, loaded := r.svc.loadMessages(ctx, id, candidateSources(msgSource, matchedSource), r.opts.Debug)
 	if !loaded {
 		debugf(r.opts.Debug, "skip transcript id=%s reason=no_messages elapsed=%s", id, time.Since(sessionStart).Round(time.Millisecond))
-		return
+		return nil
 	}
 	if d.meta != nil {
 		if fallback, err := d.meta.SessionMeta(ctx, id); err == nil {
@@ -219,67 +244,72 @@ func (r *indexRun) transcriptSession(ctx context.Context, id string, d discovere
 			debugf(r.opts.Debug, "session meta fallback failed id=%s err=%v", id, err)
 		}
 	}
-	r.writeSession(ctx, id, sess, msgs, fp, loadedSource, sessionStart)
+	return r.writeSession(ctx, id, sess, msgs, fp, loadedSource, sessionStart)
 }
 
 // catalogSession indexes a session discovered through a cheap catalog: the
 // stored hash decides the skip before any file content is parsed.
-func (r *indexRun) catalogSession(ctx context.Context, id string, d discoveredTranscript) {
+func (r *indexRun) catalogSession(ctx context.Context, id string, d discoveredTranscript) error {
 	sessionStart := time.Now()
 	fp := d.catalog.Fingerprint
 	if !r.opts.Force && fp.Path != "" && fp.Hash != "" {
 		if stored, ok := r.hashes[fp.Path]; ok && stored == fp.Hash {
 			r.stats.Skipped++
 			debugf(r.opts.Debug, "skip transcript id=%s path=%s elapsed=%s", id, fp.Path, time.Since(sessionStart).Round(time.Millisecond))
-			return
+			return nil
 		}
 	}
 
 	sess, err := d.meta.SessionMeta(ctx, id)
 	if err != nil {
-		debugf(r.opts.Debug, "session meta failed id=%s err=%v", id, err)
-		return
+		return r.fail("session meta failed id=%s: %w", id, err)
 	}
 	if d.session != nil {
-		sess = mergeSessionMetadata(sess, *d.session)
+		sess = mergeSessionMetadata(*d.session, sess)
 	}
-	msgs, loadedSource, loaded := r.svc.loadMessages(ctx, id, d.source, r.opts.Debug)
+	msgSource := d.messageSource
+	if msgSource == nil {
+		msgSource = d.source
+	}
+	msgs, loadedSource, loaded := r.svc.loadMessages(ctx, id, candidateSources(msgSource), r.opts.Debug)
 	if !loaded {
 		debugf(r.opts.Debug, "skip transcript id=%s reason=no_messages elapsed=%s", id, time.Since(sessionStart).Round(time.Millisecond))
-		return
+		return nil
 	}
-	r.writeSession(ctx, id, sess, msgs, fp, loadedSource, sessionStart)
+	return r.writeSession(ctx, id, sess, msgs, fp, loadedSource, sessionStart)
 }
 
-func (r *indexRun) writeSession(ctx context.Context, id string, sess domain.Session, msgs []domain.Message, fp domain.TranscriptFingerprint, loadedSource domain.TranscriptSource, sessionStart time.Time) {
+func (r *indexRun) writeSession(ctx context.Context, id string, sess domain.Session, msgs []domain.Message, fp domain.TranscriptFingerprint, loadedSource domain.TranscriptSource, sessionStart time.Time) error {
 	sess.MessageCount = len(msgs)
 	sess.RecordKind = domain.RecordChat
 	if sess.Vendor == "" {
 		sess.Vendor = domain.VendorClaude
 	}
 	if err := r.svc.repo.ReplaceSession(ctx, sess, msgs); err != nil {
-		debugf(r.opts.Debug, "replace transcript failed id=%s err=%v", id, err)
-		return
+		return r.fail("replace transcript failed id=%s: %w", id, err)
 	}
+	r.stats.Indexed++
+	var hashErr error
 	if fp.Path == "" || fp.Hash == "" {
 		fp = r.svc.transcriptFingerprint(ctx, loadedSource, id, r.opts.Debug)
 	}
 	if fp.Path != "" && fp.Hash != "" {
 		if err := r.svc.repo.SetFileHash(ctx, fp.Path, sess.ID, fp.Hash); err != nil {
-			debugf(r.opts.Debug, "store transcript fingerprint failed id=%s path=%s err=%v", id, fp.Path, err)
+			hashErr = r.fail("store transcript fingerprint failed id=%s path=%s: %w", id, fp.Path, err)
 		} else {
 			r.hashes[fp.Path] = fp.Hash
 		}
 	}
 	r.stats.Messages += len(msgs)
 	debugf(r.opts.Debug, "indexed transcript id=%s messages=%d path=%s elapsed=%s", id, len(msgs), fp.Path, time.Since(sessionStart).Round(time.Millisecond))
+	return hashErr
 }
 
 // promptOnlySession indexes prompts with no transcript. The stored digest of
 // the prompts decides the skip, so re-runs stop rewriting these sessions.
-func (r *indexRun) promptOnlySession(ctx context.Context, id string, prompts []domain.Prompt) {
+func (r *indexRun) promptOnlySession(ctx context.Context, id string, prompts []domain.Prompt) error {
 	if len(prompts) == 0 {
-		return
+		return nil
 	}
 	sessionStart := time.Now()
 	r.stats.Orphaned++
@@ -290,22 +320,24 @@ func (r *indexRun) promptOnlySession(ctx context.Context, id string, prompts []d
 		if stored, ok := r.hashes[key]; ok && stored == digest {
 			r.stats.Skipped++
 			debugf(r.opts.Debug, "skip prompt-only id=%s elapsed=%s", id, time.Since(sessionStart).Round(time.Millisecond))
-			return
+			return nil
 		}
 	}
 
 	sess := synthesizeSession(id, prompts)
 	msgs := promptsToMessages(id, prompts)
 	if err := r.svc.repo.ReplaceSession(ctx, sess, msgs); err != nil {
-		debugf(r.opts.Debug, "replace prompt-only failed id=%s err=%v", id, err)
-		return
+		return r.fail("replace prompt-only failed id=%s: %w", id, err)
 	}
+	r.stats.Indexed++
 	r.hashes[key] = digest
+	var hashErr error
 	if err := r.svc.repo.SetFileHash(ctx, key, id, digest); err != nil {
-		debugf(r.opts.Debug, "store prompt-only digest failed id=%s err=%v", id, err)
+		hashErr = r.fail("store prompt-only digest failed id=%s: %w", id, err)
 	}
 	r.stats.Messages += len(msgs)
 	debugf(r.opts.Debug, "indexed prompt-only id=%s messages=%d elapsed=%s", id, len(msgs), time.Since(sessionStart).Round(time.Millisecond))
+	return hashErr
 }
 
 // promptDigest hashes everything that shapes a prompt-only session, so a
@@ -320,9 +352,14 @@ func promptDigest(prompts []domain.Prompt) string {
 	return "history-prompts-v1:" + hex.EncodeToString(sum[:])
 }
 
-// loadMessages streams a session from the first source that yields messages.
-func (s *IndexService) loadMessages(ctx context.Context, sessionID string, first domain.TranscriptSource, debug io.Writer) ([]domain.Message, domain.TranscriptSource, bool) {
-	for _, src := range orderedTranscriptSources(s.transcripts, first) {
+// loadMessages streams a session from the first candidate source that yields
+// messages. Callers pass only the sources that can hold this session, so a miss
+// does not probe every adapter.
+func (s *IndexService) loadMessages(ctx context.Context, sessionID string, candidates []domain.TranscriptSource, debug io.Writer) ([]domain.Message, domain.TranscriptSource, bool) {
+	if len(candidates) == 0 {
+		candidates = s.transcripts
+	}
+	for _, src := range candidates {
 		var candidate []domain.Message
 		if err := src.Messages(ctx, sessionID, func(m domain.Message) error {
 			candidate = append(candidate, m)
@@ -338,7 +375,29 @@ func (s *IndexService) loadMessages(ctx context.Context, sessionID string, first
 	return nil, nil, false
 }
 
-func (s *IndexService) indexPlans(ctx context.Context, indexCfg config.IndexConfig, home string, opts IndexRunOptions) (IndexStats, error) {
+// candidateSources returns the non-nil sources in order, deduplicated.
+func candidateSources(sources ...domain.TranscriptSource) []domain.TranscriptSource {
+	var out []domain.TranscriptSource
+	for _, src := range sources {
+		if src == nil {
+			continue
+		}
+		seen := false
+		for _, prev := range out {
+			if prev == src {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			out = append(out, src)
+		}
+	}
+	return out
+}
+
+func (r *indexRun) indexPlans(ctx context.Context, indexCfg config.IndexConfig, home string) (IndexStats, error) {
+	s := r.svc
 	var stats IndexStats
 
 	sources := s.plans
@@ -349,48 +408,50 @@ func (s *IndexService) indexPlans(ctx context.Context, indexCfg config.IndexConf
 	for _, src := range sources {
 		paths, err := src.PlanPaths(ctx)
 		if err != nil {
-			return IndexStats{}, fmt.Errorf("plan paths: %w", err)
+			return stats, r.fail("plan paths: %w", err)
 		}
-		debugf(opts.Debug, "discovered plan source=%T paths=%d", src, len(paths))
+		debugf(r.opts.Debug, "discovered plan source=%T paths=%d", src, len(paths))
 		for _, path := range paths {
 			planStart := time.Now()
-			p, skipped, err := s.indexPlanPath(ctx, path, "", opts.Force, domain.VendorClaude)
+			p, skipped, err := s.indexPlanPath(ctx, path, "", r.opts.Force, domain.VendorClaude)
 			if err != nil {
-				debugf(opts.Debug, "index plan failed path=%s err=%v", path, err)
+				_ = r.fail("index plan failed path=%s: %w", path, err)
 				continue
 			}
 			if skipped {
 				stats.Skipped++
-				debugf(opts.Debug, "skip plan id=%s path=%s elapsed=%s", p.ID, path, time.Since(planStart).Round(time.Millisecond))
+				debugf(r.opts.Debug, "skip plan id=%s path=%s elapsed=%s", p.ID, path, time.Since(planStart).Round(time.Millisecond))
 				continue
 			}
 			stats.Plans++
+			stats.Indexed++
 			stats.Messages++
-			debugf(opts.Debug, "indexed plan id=%s path=%s elapsed=%s", p.ID, path, time.Since(planStart).Round(time.Millisecond))
+			debugf(r.opts.Debug, "indexed plan id=%s path=%s elapsed=%s", p.ID, path, time.Since(planStart).Round(time.Millisecond))
 		}
 	}
 
 	cursorSrc := cursorplan.NewSource(home)
 	cursorPaths, err := cursorSrc.PlanPaths(ctx)
 	if err != nil {
-		return stats, fmt.Errorf("cursor plan paths: %w", err)
+		return stats, r.fail("cursor plan paths: %w", err)
 	}
-	debugf(opts.Debug, "discovered cursor plans paths=%d", len(cursorPaths))
+	debugf(r.opts.Debug, "discovered cursor plans paths=%d", len(cursorPaths))
 	for _, path := range cursorPaths {
 		planStart := time.Now()
-		p, skipped, err := s.indexCursorPlanPath(ctx, path, opts.Force)
+		p, skipped, err := s.indexCursorPlanPath(ctx, path, r.opts.Force)
 		if err != nil {
-			debugf(opts.Debug, "index cursor plan failed path=%s err=%v", path, err)
+			_ = r.fail("index cursor plan failed path=%s: %w", path, err)
 			continue
 		}
 		if skipped {
 			stats.Skipped++
-			debugf(opts.Debug, "skip cursor plan id=%s path=%s elapsed=%s", p.ID, path, time.Since(planStart).Round(time.Millisecond))
+			debugf(r.opts.Debug, "skip cursor plan id=%s path=%s elapsed=%s", p.ID, path, time.Since(planStart).Round(time.Millisecond))
 			continue
 		}
 		stats.Plans++
+		stats.Indexed++
 		stats.Messages++
-		debugf(opts.Debug, "indexed cursor plan id=%s path=%s elapsed=%s", p.ID, path, time.Since(planStart).Round(time.Millisecond))
+		debugf(r.opts.Debug, "indexed cursor plan id=%s path=%s elapsed=%s", p.ID, path, time.Since(planStart).Round(time.Millisecond))
 	}
 
 	return stats, nil
@@ -615,6 +676,15 @@ func debugf(w io.Writer, format string, args ...any) {
 		return
 	}
 	fmt.Fprintf(w, "[debug] "+format+"\n", args...)
+}
+
+// warnf reports a failure regardless of --debug. Callers pass options.Warn,
+// which the CLI points at stderr: stdout is the MCP protocol channel.
+func warnf(w io.Writer, format string, args ...any) {
+	if w == nil {
+		return
+	}
+	fmt.Fprintf(w, "[warn] "+format+"\n", args...)
 }
 
 func synthesizeSession(id string, prompts []domain.Prompt) domain.Session {

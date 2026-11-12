@@ -3,6 +3,7 @@ package app_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -547,6 +548,150 @@ func TestPromptOnlySkipOnRun(t *testing.T) {
 	}
 	if len(hits) == 0 {
 		t.Fatal("expected prompt-only session to remain searchable")
+	}
+}
+
+func TestOverlappingCatalogAndSessionsSources(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	ts := time.Now().UTC()
+	fp := domain.TranscriptFingerprint{Path: filepath.Join(home, "overlap.jsonl"), Hash: "transcript-meta-v1:overlap"}
+
+	catalog := &fakeCatalogSource{
+		entries: []domain.TranscriptCatalogEntry{{ID: "sess-overlap", Vendor: domain.VendorClaude, Fingerprint: fp}},
+		metas: map[string]domain.Session{"sess-overlap": {
+			ID: "sess-overlap", Title: "Catalog Meta", HasTranscript: true,
+			FilePath: fp.Path, StartedAt: ts, EndedAt: ts,
+		}},
+		msgs: map[string][]domain.Message{
+			"sess-overlap": {{
+				UUID: "catalog-m1", SessionID: "sess-overlap",
+				Role: domain.RoleUser, Kind: domain.KindText,
+				Text: "catalog source text", Source: domain.SourceTranscript,
+				Timestamp: ts, Sequence: 0,
+			}},
+		},
+		metaCalls: map[string]int{},
+		msgCalls:  map[string]int{},
+	}
+	plain := &fakeTranscriptSource{
+		sessions: []domain.Session{{
+			ID: "sess-overlap", Title: "Plain Title", HasTranscript: true,
+			FilePath: filepath.Join(home, "plain.jsonl"), StartedAt: ts, EndedAt: ts,
+			Vendor: domain.VendorClaudeDesktop,
+		}},
+		msgs: map[string][]domain.Message{
+			"sess-overlap": {{
+				UUID: "plain-m1", SessionID: "sess-overlap",
+				Role: domain.RoleUser, Kind: domain.KindText,
+				Text: "plain source text", Source: domain.SourceTranscript,
+				Timestamp: ts, Sequence: 0,
+			}},
+		},
+		fingerprints: map[string]domain.TranscriptFingerprint{
+			"sess-overlap": {Path: filepath.Join(home, "plain.jsonl"), Hash: "plain"},
+		},
+		messageCalls: map[string]int{},
+	}
+
+	repo := openRepo(t)
+	svc := app.NewIndexServiceMulti(
+		[]domain.TranscriptSource{catalog, plain},
+		&fakePromptLog{},
+		nil,
+		repo,
+		domain.DefaultShrinkConfig,
+	)
+
+	stats1, err := svc.Run(ctx, config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats1.Sessions != 1 || stats1.Indexed != 1 || stats1.Messages != 1 {
+		t.Fatalf("expected one indexed session, got %+v", stats1)
+	}
+	if catalog.msgCalls["sess-overlap"] != 0 {
+		t.Fatalf("catalog source should not load messages, got %d", catalog.msgCalls["sess-overlap"])
+	}
+	if plain.messageCalls["sess-overlap"] != 1 {
+		t.Fatalf("later source should load messages once, got %d", plain.messageCalls["sess-overlap"])
+	}
+
+	detail, err := repo.SessionByID(ctx, "sess-overlap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Session.Title != "Plain Title" {
+		t.Fatalf("title = %q, want later source primary metadata", detail.Session.Title)
+	}
+	if detail.Session.Vendor != domain.VendorClaudeDesktop {
+		t.Fatalf("vendor = %q, want later source vendor", detail.Session.Vendor)
+	}
+	if len(detail.Messages) != 1 || detail.Messages[0].Text != "plain source text" {
+		t.Fatalf("messages = %+v", detail.Messages)
+	}
+
+	stats2, err := svc.Run(ctx, config.IndexConfig{}, home, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats2.Skipped != 1 || stats2.Indexed != 0 || stats2.Messages != 0 {
+		t.Fatalf("expected catalog fast path to skip on second run, got %+v", stats2)
+	}
+	if catalog.metaCalls["sess-overlap"] != 1 {
+		t.Fatalf("expected unchanged session not to parse meta again, got %d", catalog.metaCalls["sess-overlap"])
+	}
+	if plain.messageCalls["sess-overlap"] != 1 {
+		t.Fatalf("expected unchanged session not to parse messages again, got %d", plain.messageCalls["sess-overlap"])
+	}
+}
+
+type failingReplaceRepo struct {
+	domain.SearchRepository
+	err error
+}
+
+func (f failingReplaceRepo) ReplaceSession(context.Context, domain.Session, []domain.Message) error {
+	return f.err
+}
+
+func TestRunReturnsErrorOnReplaceFailure(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	ts := time.Now().UTC()
+
+	src := &fakeTranscriptSource{
+		sessions: []domain.Session{{
+			ID: "sess-boom", Title: "Boom", HasTranscript: true,
+			StartedAt: ts, EndedAt: ts,
+		}},
+		msgs: map[string][]domain.Message{
+			"sess-boom": {{
+				UUID: "m1", SessionID: "sess-boom",
+				Role: domain.RoleUser, Kind: domain.KindText,
+				Text: "replace failure phrase", Source: domain.SourceTranscript,
+				Timestamp: ts, Sequence: 0,
+			}},
+		},
+	}
+
+	repo := openRepo(t)
+	wrapped := failingReplaceRepo{SearchRepository: repo, err: errors.New("boom")}
+	svc := app.NewIndexService(src, &fakePromptLog{}, nil, wrapped, domain.DefaultShrinkConfig)
+
+	var warn bytes.Buffer
+	stats, err := svc.RunWithOptions(ctx, config.IndexConfig{}, home, nil, app.IndexRunOptions{Warn: &warn})
+	if err == nil {
+		t.Fatal("expected run to return the replace failure")
+	}
+	if stats.Failed != 1 {
+		t.Fatalf("stats.Failed = %d, want 1", stats.Failed)
+	}
+	if stats.Indexed != 0 {
+		t.Fatalf("stats.Indexed = %d, want 0", stats.Indexed)
+	}
+	if !strings.Contains(warn.String(), "replace transcript failed id=sess-boom") {
+		t.Fatalf("expected warning on stderr writer, got %q", warn.String())
 	}
 }
 
