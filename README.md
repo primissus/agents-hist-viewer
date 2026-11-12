@@ -57,7 +57,7 @@ The index DB is stored at `${XDG_DATA_HOME:-~/.local/share}/chv/chv.db`.
 Scans **Claude Code** transcripts, **Claude Desktop** agent-session metadata, typed prompts, and plan markdown, plus **Cursor** agent transcripts and Cursor plan files, **OpenCode** sessions, and **Codex** rollout transcripts, into the FTS5 search index. Progress is printed to stderr (`Indexing N/M…`); a summary goes to stdout:
 
 ```
-Sessions: 42  Orphaned: 3  Plans: 2  Skipped: 10  Messages: 1284  Elapsed: 1.2s
+Sessions: 42  Indexed: 40  Orphaned: 3  Plans: 2  Skipped: 10  Failed: 0  Messages: 1284  Elapsed: 1.2s
 ```
 
 | Source | Vendor | Record kind |
@@ -75,7 +75,7 @@ Session IDs are namespaced to avoid collisions: Claude Code chats use the transc
 
 **Upgrading** — schema changes (e.g. adding `vendor`) are applied automatically when you run `chv index`. If you upgraded chv and the TUI errors on an old DB, run `chv index` once before searching.
 
-Plan files (`PLAN.md`, `PROGRESS.md` by default) are discovered with [`fd`](https://github.com/sharkdp/fd) under `~/.claude` and any directories listed in the index config. The scanner matches basenames case-insensitively, skips `*.original.md`, and falls back to a Go directory walk if `fd` is not installed. Cursor plans are scanned from `~/.cursor/plans/*.plan.md` (title from YAML frontmatter `name`, then `# Heading`, then filename). Content-hash skip avoids re-indexing unchanged plan files, and transcript fingerprints avoid re-parsing unchanged chat JSONL files (`Skipped` count). Claude and Cursor sources list files with a stat-only catalog, so unchanged transcripts are skipped without reading their contents, and prompt-only sessions are skipped when their prompts are unchanged. Discovered plan files are archived to `${XDG_DATA_HOME:-~/.local/share}/chv/manual/`.
+Plan files (`PLAN.md`, `PROGRESS.md` by default) are discovered with [`fd`](https://github.com/sharkdp/fd) under `~/.claude` and any directories listed in the index config. The scanner matches basenames case-insensitively, skips `*.original.md`, and falls back to a Go directory walk if `fd` is not installed. Cursor plans are scanned from `~/.cursor/plans/*.plan.md` (title from YAML frontmatter `name`, then `# Heading`, then filename). Content-hash skip avoids re-indexing unchanged plan files, and transcript fingerprints avoid re-parsing unchanged chat JSONL files (`Skipped` count). Claude, Claude Desktop, Cursor, OpenCode, and Codex sources list sessions with a stat-only catalog, so unchanged transcripts are skipped without reading their contents; changed Claude, Cursor, and Claude Desktop sessions are parsed once, and prompt-only sessions are skipped when their prompts are unchanged. Discovered plan files are archived to `${XDG_DATA_HOME:-~/.local/share}/chv/manual/`.
 
 **Index config** — `${XDG_CONFIG_HOME:-~/.config}/chv/index.json`:
 
@@ -150,7 +150,7 @@ Index depth:
 - **`--quick`** — user prompts, tool results, plans. Skips assistant text, thinking, tool-use args.
 - **`--deep`** (default) — all block kinds. Images still dropped; tool payloads still respect `--shrink-cap`.
 
-Rerunning `chv index` is safe and idempotent. Unchanged transcript files and prompt-only sessions are skipped on later runs; changed sessions are fully replaced, so counts stay stable across reruns. Use `--force` to rebuild even when fingerprints match, and `--debug` to see discovery, skip, indexing, and error diagnostics.
+Rerunning `chv index` is safe and idempotent. Unchanged transcript files and prompt-only sessions are skipped on later runs; changed sessions are fully replaced, so counts stay stable across reruns. Use `--force` to rebuild even when fingerprints match, and `--debug` to see discovery, skip, indexing, and error diagnostics. Per-session and per-plan failures are always reported to stderr as `[warn] …`, counted in `Failed`, and make the command exit non-zero.
 
 During indexing, tool-use and tool-result payloads are truncated to `--shrink-cap` runes (when shrink is enabled). Images are always dropped. Text and thinking blocks are kept verbatim (deep mode only for thinking).
 

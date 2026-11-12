@@ -60,7 +60,8 @@ skills/
 
 - `TranscriptSource` — list sessions, stream messages
 - `TranscriptFingerprintSource` — optional transcript content fingerprint for skip logic
-- `TranscriptCatalogSource` / `TranscriptMetaSource` — optional stat-only catalog for skipping unchanged files without parsing them, plus single-session metadata for changed ones (implemented by the Claude and Cursor transcript sources)
+- `TranscriptCatalogSource` / `TranscriptMetaSource` — optional stat-only catalog for skipping unchanged files without parsing them, plus single-session metadata for changed ones (implemented by the Claude, Claude Desktop, Cursor, OpenCode, and Codex transcript sources)
+- `TranscriptSessionLoader` — optional single-pass loader returning `(Session, []Message)` for changed sessions (Claude, Cursor, Claude Desktop)
 - `PromptLog` — list typed prompts
 - `PlanSource` — list plan file paths to index
 - `SearchRepository` — init, replace session, file hash (single + batch `FileHashes`), search, recent, session detail, `SessionsByIDs` (batch session lookup for semantic-search hydration)
@@ -73,7 +74,7 @@ New I/O/storage backends implement these interfaces; logic stays in `internal/ap
 
 ## Data flow
 
-1. **Index** (`IndexService.Run`): union sessions from all `TranscriptSource` adapters + orphaned history-only sessions → `ReplaceSession` per ID (full replace, idempotent). Sources exposing a catalog are listed stat-only and compared against stored `file_hashes` (loaded once via `FileHashes`), so unchanged transcripts are never parsed; prompt-only sessions compare a digest of their prompts (`history:<id>` key). Then index Claude plans (fd/config) and Cursor plans (`~/.cursor/plans`), with content-hash skip via `file_hashes`.
+1. **Index** (`IndexService.Run`): union sessions from all `TranscriptSource` adapters + orphaned history-only sessions → `ReplaceSession` per ID (full replace, idempotent). Every source exposes a stat-only catalog; entries are compared against stored `file_hashes` (loaded once via `FileHashes`) so unchanged transcripts are never parsed. Changed Claude/Cursor/Claude Desktop sessions go through `TranscriptSessionLoader` (one parse); Codex/OpenCode use `SessionMeta` + `Messages`. Prompt-only sessions compare a digest of their prompts (`history:<id>` key). Then index Claude plans (fd/config) and Cursor plans (`~/.cursor/plans`), reading each file once and flushing all new hashes in one transaction. Per-session/per-plan failures are aggregated, warned to stderr, and returned so the CLI exits non-zero.
 2. **Search** (`SearchService`): trims and compiles user query syntax (`AND`/`OR`/groups/phrases/NOT/fuzzy) to FTS5; empty query returns nil.
 3. **View** (`ViewService`): validates/detects a single Claude/Cursor/Codex JSONL transcript and builds `SessionDetail` directly; no DB writes.
 4. **TUI** (`tui.Model`): home loads 100 recent sessions (`RecentQuery` supports path/type/vendor filters); `/` search hits full FTS (limit 500 unique sessions); query history in `config.SearchHistoryPath()`. `NewDetailApp` opens a prebuilt thread for `chv view`.
@@ -106,11 +107,12 @@ Config: `index.json` also holds `embed_model` / `chat_model` / `ollama_url` (`in
 
 | Area | Notes |
 |------|-------|
-| `adapter/transcript` | `~/.claude/projects/<proj>/<id>.jsonl`, sidechains. `VendorClaude`. Title from `custom-title`/`ai-title`. Stat-only `TranscriptCatalog`; `SessionMeta` for changed files; id→path cache. |
-| `adapter/cursor/transcript` | `~/.cursor/projects/<proj>/agent-transcripts/<id>/<id>.jsonl` + `subagents/*.jsonl`. IDs `cursor:<id>`. Project path decoded from folder name. Stat-only `TranscriptCatalog`; `SessionMeta`; id→path cache. |
+| `adapter/transcript` | `~/.claude/projects/<proj>/<id>.jsonl`, sidechains. `VendorClaude`. Title from `custom-title`/`ai-title`. Stat-only `TranscriptCatalog`; `SessionMeta` and single-pass `LoadSession`; id→path cache. |
+| `adapter/cursor/transcript` | `~/.cursor/projects/<proj>/agent-transcripts/<id>/<id>.jsonl` + `subagents/*.jsonl`. IDs `cursor:<id>`. Project path decoded from folder name. Stat-only `TranscriptCatalog`; `SessionMeta` and single-pass `LoadSession`; id→path cache. |
 | `adapter/cursor/plan` | `~/.cursor/plans/*.plan.md`. IDs `cursor-plan:<hash>`. Title from frontmatter `name`, then `# Heading`, then filename. |
-| `adapter/codex/transcript` | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` envelopes. IDs `codex:<thread-id>`. Title from first user text. `LoadFile` for `chv view`; size+mtime fingerprint. |
-| `adapter/opencode/transcript` | `opencode.db` read-only via `file:<path>?mode=ro`. Root sessions only (`parent_id IS NULL`); children → `IsSidechain`. IDs `opencode:<ses_id>`. Fingerprint = `time_updated` + message count. |
+| `adapter/codex/transcript` | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` envelopes. IDs `codex:<thread-id>`. Title from first user text. `LoadFile` for `chv view`; size+mtime fingerprint. `TranscriptCatalog` reads only each rollout's first line; `SessionMeta` scans the title for changed sessions. |
+| `adapter/opencode/transcript` | `opencode.db` read-only via `file:<path>?mode=ro&_pragma=busy_timeout(5000)`. Root sessions only (`parent_id IS NULL`); children → `IsSidechain`. IDs `opencode:<ses_id>`. Fingerprint = `time_updated` + combined root/child message count; `TranscriptCatalog` uses one aggregate query, `SessionMeta` resolves one session. |
+| `adapter/claudedesktop/transcript` | Reuses the Claude transcript parser for linked `cliSessionId` JSONL. IDs reuse the Claude transcript UUID. Stat-only `TranscriptCatalog` over cached records; `SessionMeta` returns cached metadata; `LoadSession` layers Desktop vendor/title. |
 | `adapter/history` | Resolves `[Pasted text …]` placeholders via `pastedContents`. |
 | `adapter/plan` | fd/walk scan for Claude `PLAN.md`/`PROGRESS.md` under `~/.claude` + configured `index.json` directories; `PlanSource.PlanPaths`. Manual `FromFile` for `chv index <file>`. |
 | `adapter/claudesettings` | Reads Claude `plansDirectory` settings but is not wired into indexing yet; document `index.json` for external plan directories. |
